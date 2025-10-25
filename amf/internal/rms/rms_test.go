@@ -526,6 +526,9 @@ func TestRMM_ConcurrentNotifications(t *testing.T) {
 
 	wg.Wait()
 
+	// Give notification goroutines time to start (they're spawned by HandleEvent)
+	time.Sleep(200 * time.Millisecond)
+
 	// Wait for all notifications to be processed
 	timeout := time.After(5 * time.Second)
 	ticker := time.NewTicker(100 * time.Millisecond)
