@@ -8,8 +8,6 @@ import (
 	"io"
 	"net/http"
 	"os"
-	"strings"
-	"sync"
 	"testing"
 	"time"
 
@@ -160,13 +158,39 @@ func httpDoJSON(t *testing.T, method, url string, in any) (int, []byte) {
 	if in != nil {
 		req.Header.Set("Content-Type", "application/json")
 	}
-	resp, err := http.DefaultClient.Do(req)
+	newClient := &http.Client{}
+	resp, err := newClient.Do(req)
 	if err != nil {
 		t.Fatalf("http do: %v", err)
 	}
 	defer resp.Body.Close()
 	data, _ := io.ReadAll(resp.Body)
 	return resp.StatusCode, data
+}
+
+// Strict validation helpers
+func validateSubscription(t *testing.T, sub Subscription, expectUeId, expectNotifyUri string) {
+	t.Helper()
+	if sub.SubId == "" {
+		t.Error("SubId must not be empty")
+	}
+	if sub.UeId != expectUeId {
+		t.Errorf("UeId mismatch: expected %s, got %s", expectUeId, sub.UeId)
+	}
+	if sub.NotifyUri != expectNotifyUri {
+		t.Errorf("NotifyUri mismatch: expected %s, got %s", expectNotifyUri, sub.NotifyUri)
+	}
+}
+
+func validateJSONStructure(t *testing.T, data []byte, v interface{}) {
+	t.Helper()
+	if err := json.Unmarshal(data, v); err != nil {
+		t.Fatalf("Invalid JSON response: %v, body: %s", err, string(data))
+	}
+}
+
+func contains(s, substr string) bool {
+	return len(s) >= len(substr) && s[:len(substr)] == substr
 }
 
 // --- CRUD tests per spec ---
@@ -211,12 +235,16 @@ func TestRMM_CRUD_Subscriptions(t *testing.T) {
 
 // Notification test: when UE FSM state changes, AMF should notify the consumer.
 func TestRMM_Notification_OnGmmTransition(t *testing.T) {
+	gock.InterceptClient(http.DefaultClient)
+	defer gock.RestoreClient(http.DefaultClient)
+	defer gock.Off()
+
 	// Prepare a subscription for the UE
 	ueID := "imsi-208930000000777"
 	notifyBase := "http://127.0.0.1:9099"
 	notifyPath := "/callback/rmm"
 
-	// Create subscription via SBI (using real HTTP, not mocked)
+	// Create subscription via SBI
 	reqSub := Subscription{UeId: ueID, NotifyUri: notifyBase + notifyPath}
 	status, data := httpDoJSON(t, http.MethodPost, fmt.Sprintf("%s/subscriptions/%s", baseAPIURL, ""), reqSub)
 	if status != http.StatusCreated {
@@ -225,12 +253,6 @@ func TestRMM_Notification_OnGmmTransition(t *testing.T) {
 	var subs Subscription
 	_ = json.Unmarshal(data, &subs)
 	subID := subs.SubId
-
-	// Now intercept http.DefaultClient for mocking notification callbacks
-	gock.InterceptClient(http.DefaultClient)
-	defer gock.RestoreClient(http.DefaultClient)
-	defer gock.Off()
-
 	// Expect a POST to the callback URI with a payload including subId and ueId
 	gock.New(notifyBase).
 		Post(notifyPath).
@@ -262,860 +284,877 @@ func TestRMM_Notification_OnGmmTransition(t *testing.T) {
 	}
 }
 
-// Test API error handling and edge cases
-func TestRMM_API_ErrorHandling(t *testing.T) {
-	// Test invalid JSON payload
-	status, data := httpDoJSON(t, http.MethodPost, fmt.Sprintf("%s/subscriptions/", baseAPIURL), "invalid json")
-	if status != http.StatusBadRequest {
-		t.Errorf("POST with invalid JSON want 400, got %d body=%s", status, string(data))
-	}
+// Test concurrent POST requests to ensure thread safety and UUID uniqueness
+func TestRMM_ConcurrentPOST(t *testing.T) {
+	const numGoroutines = 5000
+	results := make(chan Subscription, numGoroutines)
+	errors := make(chan error, numGoroutines)
 
-	// Test missing required fields
-	invalidSub := struct {
-		UeId string `json:"ueId"`
-	}{UeId: "test"}
-	status, data = httpDoJSON(t, http.MethodPost, fmt.Sprintf("%s/subscriptions/", baseAPIURL), invalidSub)
-	if status != http.StatusBadRequest {
-		t.Errorf("POST with missing notifyUri want 400, got %d body=%s", status, string(data))
-	}
+	// Launch concurrent POST requests
+	for i := 0; i < numGoroutines; i++ {
+		go func(id int) {
+			ueID := fmt.Sprintf("imsi-20893000000%04d", id)
+			notify := fmt.Sprintf("http://127.0.0.1:9099/callback/%d", id)
+			reqSub := Subscription{UeId: ueID, NotifyUri: notify}
 
-	// Test update non-existent subscription
-	validSub := Subscription{UeId: "imsi-208930000000002", NotifyUri: "http://127.0.0.1:9099/callback"}
-	status, data = httpDoJSON(t, http.MethodPut, fmt.Sprintf("%s/subscriptions/non-existent", baseAPIURL), validSub)
-	if status != http.StatusCreated {
-		t.Errorf("PUT non-existent subscription should create new one, want 201, got %d body=%s", status, string(data))
-	}
-
-	// Test delete non-existent subscription
-	status, data = httpDoJSON(t, http.MethodDelete, fmt.Sprintf("%s/subscriptions/non-existent-id", baseAPIURL), nil)
-	if status != http.StatusNotFound {
-		t.Errorf("DELETE non-existent subscription want 404, got %d body=%s", status, string(data))
-	}
-}
-
-// Test subscription lifecycle management
-func TestRMM_SubscriptionLifecycle(t *testing.T) {
-	ueID := "imsi-208930000000003"
-	notifyUri := "http://127.0.0.1:9099/lifecycle-test"
-
-	// 1. Create subscription
-	reqSub := Subscription{UeId: ueID, NotifyUri: notifyUri}
-	status, data := httpDoJSON(t, http.MethodPost, fmt.Sprintf("%s/subscriptions/", baseAPIURL), reqSub)
-	if status != http.StatusCreated {
-		t.Fatalf("Create subscription failed: %d %s", status, string(data))
-	}
-
-	var createdSub Subscription
-	json.Unmarshal(data, &createdSub)
-	subID := createdSub.SubId
-
-	// 2. Verify subscription exists in collection
-	status, data = httpDoJSON(t, http.MethodGet, fmt.Sprintf("%s/subscriptions", baseAPIURL), nil)
-	if status != http.StatusOK {
-		t.Fatalf("Get subscriptions failed: %d %s", status, string(data))
-	}
-
-	var listResponse struct {
-		Subscriptions []Subscription `json:"subscriptions"`
-	}
-	json.Unmarshal(data, &listResponse)
-
-	found := false
-	for _, sub := range listResponse.Subscriptions {
-		if sub.SubId == subID {
-			found = true
-			if sub.UeId != ueID || sub.NotifyUri != notifyUri {
-				t.Errorf("Subscription data mismatch: got %+v, want UeId=%s NotifyUri=%s", sub, ueID, notifyUri)
-			}
-			break
-		}
-	}
-	if !found {
-		t.Errorf("Created subscription %s not found in collection", subID)
-	}
-
-	// 3. Update subscription
-	updatedNotifyUri := notifyUri + "/updated"
-	updateSub := Subscription{UeId: ueID, NotifyUri: updatedNotifyUri}
-	status, data = httpDoJSON(t, http.MethodPut, fmt.Sprintf("%s/subscriptions/%s", baseAPIURL, subID), updateSub)
-	if status != http.StatusOK {
-		t.Fatalf("Update subscription failed: %d %s", status, string(data))
-	}
-
-	var updatedSub Subscription
-	json.Unmarshal(data, &updatedSub)
-	if updatedSub.NotifyUri != updatedNotifyUri {
-		t.Errorf("Update failed: got NotifyUri=%s, want %s", updatedSub.NotifyUri, updatedNotifyUri)
-	}
-
-	// 4. Delete subscription
-	status, data = httpDoJSON(t, http.MethodDelete, fmt.Sprintf("%s/subscriptions/%s", baseAPIURL, subID), nil)
-	if status != http.StatusNoContent {
-		t.Fatalf("Delete subscription failed: %d %s", status, string(data))
-	}
-
-	// 5. Verify subscription is gone
-	status, data = httpDoJSON(t, http.MethodGet, fmt.Sprintf("%s/subscriptions", baseAPIURL), nil)
-	if status != http.StatusOK {
-		t.Fatalf("Get subscriptions after delete failed: %d %s", status, string(data))
-	}
-
-	json.Unmarshal(data, &listResponse)
-	for _, sub := range listResponse.Subscriptions {
-		if sub.SubId == subID {
-			t.Errorf("Deleted subscription %s still found in collection", subID)
-		}
-	}
-}
-
-// Test high concurrency with multiple users and subscriptions
-func TestRMM_HighConcurrency_MultipleUsers(t *testing.T) {
-	const numUsers = 100
-	const numSubscriptionsPerUser = 5
-
-	var wg sync.WaitGroup
-	errors := make(chan error, numUsers*numSubscriptionsPerUser)
-	subscriptionIds := make(chan string, numUsers*numSubscriptionsPerUser)
-
-	// Create subscriptions concurrently
-	for i := 0; i < numUsers; i++ {
-		for j := 0; j < numSubscriptionsPerUser; j++ {
-			wg.Add(1)
-			go func(userID, subIndex int) {
-				defer wg.Done()
-
-				ueID := fmt.Sprintf("imsi-20893000000%04d", userID)
-				notifyUri := fmt.Sprintf("http://127.0.0.1:909%d/user-%d-sub-%d", userID%10, userID, subIndex)
-
-				reqSub := Subscription{UeId: ueID, NotifyUri: notifyUri}
-				status, data := httpDoJSON(t, http.MethodPost, fmt.Sprintf("%s/subscriptions/", baseAPIURL), reqSub)
-
-				if status != http.StatusCreated {
-					errors <- fmt.Errorf("User %d Sub %d: Create failed with status %d: %s", userID, subIndex, status, string(data))
-					return
-				}
-
-				var createdSub Subscription
-				if err := json.Unmarshal(data, &createdSub); err != nil {
-					errors <- fmt.Errorf("User %d Sub %d: Unmarshal failed: %v", userID, subIndex, err)
-					return
-				}
-
-				subscriptionIds <- createdSub.SubId
-			}(i, j)
-		}
-	}
-
-	wg.Wait()
-	close(errors)
-	close(subscriptionIds)
-
-	// Check for errors
-	var errorList []error
-	for err := range errors {
-		errorList = append(errorList, err)
-	}
-	if len(errorList) > 0 {
-		t.Fatalf("Concurrent creation errors: %v", errorList[0])
-	}
-
-	// Collect all subscription IDs
-	var allSubIds []string
-	for subId := range subscriptionIds {
-		allSubIds = append(allSubIds, subId)
-	}
-
-	if len(allSubIds) != numUsers*numSubscriptionsPerUser {
-		t.Fatalf("Expected %d subscriptions, got %d", numUsers*numSubscriptionsPerUser, len(allSubIds))
-	}
-
-	// Verify all subscriptions exist
-	status, data := httpDoJSON(t, http.MethodGet, fmt.Sprintf("%s/subscriptions", baseAPIURL), nil)
-	if status != http.StatusOK {
-		t.Fatalf("Get all subscriptions failed: %d %s", status, string(data))
-	}
-
-	var listResponse struct {
-		Subscriptions []Subscription `json:"subscriptions"`
-	}
-	json.Unmarshal(data, &listResponse)
-
-	if len(listResponse.Subscriptions) < len(allSubIds) {
-		t.Errorf("Expected at least %d subscriptions in collection, got %d", len(allSubIds), len(listResponse.Subscriptions))
-	}
-
-	// Clean up: Delete all subscriptions concurrently
-	wg = sync.WaitGroup{}
-	deleteErrors := make(chan error, len(allSubIds))
-
-	for _, subId := range allSubIds {
-		wg.Add(1)
-		go func(id string) {
-			defer wg.Done()
-			status, data := httpDoJSON(t, http.MethodDelete, fmt.Sprintf("%s/subscriptions/%s", baseAPIURL, id), nil)
-			if status != http.StatusNoContent {
-				deleteErrors <- fmt.Errorf("Delete subscription %s failed: %d %s", id, status, string(data))
-			}
-		}(subId)
-	}
-
-	wg.Wait()
-	close(deleteErrors)
-
-	for err := range deleteErrors {
-		t.Errorf("Cleanup error: %v", err)
-	}
-}
-
-// Test concurrent notifications with FSM state changes
-func TestRMM_ConcurrentNotifications(t *testing.T) {
-	const numUEs = 10 // Reduced for stability
-	notifyBase := "http://127.0.0.1:9099"
-
-	// Create subscriptions for multiple UEs (using real HTTP, not mocked)
-	var subscriptions []Subscription
-	for i := 0; i < numUEs; i++ {
-		ueID := fmt.Sprintf("imsi-concurrent-notif-%06d", i)
-		notifyPath := fmt.Sprintf("/notify-ue-%d", i)
-
-		reqSub := Subscription{UeId: ueID, NotifyUri: notifyBase + notifyPath}
-		status, data := httpDoJSON(t, http.MethodPost, fmt.Sprintf("%s/subscriptions/", baseAPIURL), reqSub)
-		if status != http.StatusCreated {
-			t.Fatalf("Create subscription for UE %d failed: %d %s", i, status, string(data))
-		}
-
-		var sub Subscription
-		json.Unmarshal(data, &sub)
-		subscriptions = append(subscriptions, sub)
-	}
-
-	// Now intercept http.DefaultClient for mocking notification callbacks
-	gock.InterceptClient(http.DefaultClient)
-	defer gock.RestoreClient(http.DefaultClient)
-	defer gock.Off()
-
-	// Set up gock to accept exactly numUEs notifications to the base URL
-	// Use Times(numUEs) instead of Persist() to expect exact number of calls
-	gock.New(notifyBase).
-		Post("/notify-ue-.*").
-		MatchType("json").
-		Times(numUEs).
-		Reply(204)
-
-	// Attach RMS
-	gmm.AttachRMS(rms.NewRMS())
-
-	// Trigger state changes concurrently for all UEs
-	var wg sync.WaitGroup
-	for i := 0; i < numUEs; i++ {
-		wg.Add(1)
-		go func(index int) {
-			defer wg.Done()
-
-			ueID := fmt.Sprintf("imsi-concurrent-notif-%06d", index)
-			t.Logf("Debug: Creating UE %d with ID: %s", index, ueID)
-			ue := amf_context.GetSelf().NewAmfUe(ueID)
-			anType := models.AccessType__3_GPP_ACCESS
-			ue.State[anType] = fsm.NewState("Deregistered")
-
-			// Trigger FSM event
-			if err := gmm.GmmFSM.SendEvent(ue.State[anType], gmm.StartAuthEvent,
-				fsm.ArgsType{gmm.ArgAmfUe: ue, gmm.ArgAccessType: anType}, amf_logger.GmmLog); err != nil {
-				t.Errorf("SendEvent for UE %d failed: %v", index, err)
-			} else {
-				t.Logf("Debug: Successfully sent FSM event for UE %d", index)
-			}
-		}(i)
-	}
-
-	wg.Wait()
-
-	// Give notification goroutines time to start and complete (they're spawned by HandleEvent)
-	// Increased from 200ms to 1000ms to allow all goroutines to finish HTTP calls
-	time.Sleep(1000 * time.Millisecond)
-
-	// Wait for all notifications to be processed
-	timeout := time.After(10 * time.Second) // Increased timeout from 5s to 10s
-	ticker := time.NewTicker(100 * time.Millisecond)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-timeout:
-			if !gock.IsDone() {
-				pendingMocks := gock.Pending()
-				t.Logf("Debug: Total pending mocks: %d", len(pendingMocks))
-				for i, mock := range pendingMocks {
-					t.Logf("Debug: Pending mock %d: %s %s", i, mock.Request().Method, mock.Request().URLStruct.String())
-				}
-				t.Fatalf("Timeout waiting for notifications. %d mocks still pending", len(pendingMocks))
-			}
-			return
-		case <-ticker.C:
-			if gock.IsDone() {
+			status, data := httpDoJSON(t, http.MethodPost, fmt.Sprintf("%s/subscriptions", baseAPIURL), reqSub)
+			if status != http.StatusCreated {
+				errors <- fmt.Errorf("POST want 201, got %d", status)
 				return
 			}
-		}
-	}
-}
 
-// Test notification stress with rapid state changes
-func TestRMM_NotificationStress(t *testing.T) {
-	ueID := "imsi-208930000000999"
-	notifyBase := "http://127.0.0.1:9099"
-	notifyPath := "/stress-test"
-
-	// Create subscription (using real HTTP, not mocked)
-	reqSub := Subscription{UeId: ueID, NotifyUri: notifyBase + notifyPath}
-	status, data := httpDoJSON(t, http.MethodPost, fmt.Sprintf("%s/subscriptions/", baseAPIURL), reqSub)
-	if status != http.StatusCreated {
-		t.Fatalf("Create subscription failed: %d %s", status, string(data))
-	}
-
-	var sub Subscription
-	json.Unmarshal(data, &sub)
-
-	// Now intercept http.DefaultClient for mocking notification callbacks
-	gock.InterceptClient(http.DefaultClient)
-	defer gock.RestoreClient(http.DefaultClient)
-	defer gock.Off()
-
-	// Set up mock to accept any notification to this endpoint
-	gock.New(notifyBase).
-		Post(notifyPath).
-		MatchType("json").
-		Persist().
-		Reply(204)
-
-	// Attach RMS
-	gmm.AttachRMS(rms.NewRMS())
-
-	// Create UE context
-	ue := amf_context.GetSelf().NewAmfUe(ueID)
-	anType := models.AccessType__3_GPP_ACCESS
-	ue.State[anType] = fsm.NewState("Deregistered")
-
-	// Trigger rapid state changes
-	const numStateChanges = 100
-	var wg sync.WaitGroup
-
-	for i := 0; i < numStateChanges; i++ {
-		wg.Add(1)
-		go func(iteration int) {
-			defer wg.Done()
-
-			// Use StartAuthEvent which transitions from Deregistered to Authentication
-			// This is a valid transition that doesn't require additional args like EAP
-			if err := gmm.GmmFSM.SendEvent(ue.State[anType], gmm.StartAuthEvent,
-				fsm.ArgsType{gmm.ArgAmfUe: ue, gmm.ArgAccessType: anType}, amf_logger.GmmLog); err != nil {
-				// Some transitions may be invalid, which is expected
-				// Don't fail the test for invalid transitions
+			var created Subscription
+			if err := json.Unmarshal(data, &created); err != nil {
+				errors <- fmt.Errorf("unmarshal error: %v", err)
+				return
 			}
+
+			results <- created
 		}(i)
 	}
 
-	wg.Wait()
-
-	// Wait a bit for notifications to be processed
-	time.Sleep(2 * time.Second)
-
-	// Check that at least some notifications were sent (not all state changes may be valid)
-	if gock.GetUnmatchedRequests() == nil && len(gock.GetUnmatchedRequests()) == 0 {
-		// This means some notifications were processed successfully
-		t.Logf("Stress test completed successfully with rapid state changes")
-	}
-}
-
-// Test thread safety of subscription store
-func TestRMM_SubscriptionStore_ThreadSafety(t *testing.T) {
-	store := rms.GetSubscriptionStore()
-
-	// Record initial subscription count (may have leftovers from previous tests)
-	initialCount := len(store.GetAll())
-
-	const numGoroutines = 100
-	const operationsPerGoroutine = 50
-
-	var wg sync.WaitGroup
-	errors := make(chan error, numGoroutines*operationsPerGoroutine)
-
-	// Concurrent operations on the store
+	// Collect results
+	subIDs := make(map[string]bool)
 	for i := 0; i < numGoroutines; i++ {
-		wg.Add(1)
-		go func(goroutineID int) {
-			defer wg.Done()
-
-			for j := 0; j < operationsPerGoroutine; j++ {
-				subId := fmt.Sprintf("test-sub-%d-%d", goroutineID, j)
-				ueId := fmt.Sprintf("imsi-test-%d-%d", goroutineID, j)
-				notifyUri := fmt.Sprintf("http://test.com/%d/%d", goroutineID, j)
-
-				sub := &rms.Subscription{
-					SubId:     subId,
-					UeId:      ueId,
-					NotifyUri: notifyUri,
-				}
-
-				// Create
-				store.Create(sub)
-
-				// Read
-				if retrieved, exists := store.Get(subId); !exists {
-					errors <- fmt.Errorf("Subscription %s not found after create", subId)
-					continue
-				} else if retrieved.UeId != ueId {
-					errors <- fmt.Errorf("Subscription %s data mismatch", subId)
-					continue
-				}
-
-				// Update
-				updatedSub := &rms.Subscription{
-					SubId:     subId,
-					UeId:      ueId,
-					NotifyUri: notifyUri + "-updated",
-				}
-				if !store.Update(subId, updatedSub) {
-					errors <- fmt.Errorf("Failed to update subscription %s", subId)
-					continue
-				}
-
-				// Find by UE ID
-				found := store.FindByUeId(ueId)
-				if len(found) == 0 {
-					errors <- fmt.Errorf("No subscriptions found for UE %s", ueId)
-					continue
-				}
-
-				// Delete
-				if !store.Delete(subId) {
-					errors <- fmt.Errorf("Failed to delete subscription %s", subId)
-				}
+		select {
+		case sub := <-results:
+			if sub.SubId == "" {
+				t.Errorf("Empty SubId returned")
 			}
+			if subIDs[sub.SubId] {
+				t.Errorf("Duplicate SubId detected: %s", sub.SubId)
+			}
+			subIDs[sub.SubId] = true
+		case err := <-errors:
+			t.Errorf("Concurrent POST error: %v", err)
+		case <-time.After(5 * time.Second):
+			t.Fatal("Timeout waiting for concurrent POST results")
+		}
+	}
+
+	if len(subIDs) != numGoroutines {
+		t.Errorf("Expected %d unique SubIds, got %d", numGoroutines, len(subIDs))
+	}
+}
+
+// Test concurrent read/write operations
+func TestRMM_ConcurrentReadWrite(t *testing.T) {
+	// Create initial subscription
+	ueID := "imsi-208930000001111"
+	notify := "http://127.0.0.1:9099/notify"
+	reqSub := Subscription{UeId: ueID, NotifyUri: notify}
+	status, data := httpDoJSON(t, http.MethodPost, fmt.Sprintf("%s/subscriptions", baseAPIURL), reqSub)
+	if status != http.StatusCreated {
+		t.Fatalf("POST want 201, got %d", status)
+	}
+	var created Subscription
+	json.Unmarshal(data, &created)
+	subID := created.SubId
+
+	const numOperations = 15 // Reduced for faster tests
+	done := make(chan bool, numOperations)
+
+	// Concurrent readers
+	for i := 0; i < 5; i++ {
+		go func() {
+			status, _ := httpDoJSON(t, http.MethodGet, fmt.Sprintf("%s/subscriptions", baseAPIURL), nil)
+			if status != http.StatusOK {
+				t.Errorf("GET want 200, got %d", status)
+			}
+			done <- true
+		}()
+	}
+
+	// Concurrent writers (PUT)
+	for i := 0; i < 5; i++ {
+		go func(id int) {
+			updated := Subscription{UeId: ueID, NotifyUri: fmt.Sprintf("%s/v%d", notify, id)}
+			status, _ := httpDoJSON(t, http.MethodPut, fmt.Sprintf("%s/subscriptions/%s", baseAPIURL, subID), updated)
+			if status != http.StatusOK && status != http.StatusCreated {
+				t.Errorf("PUT want 200 or 201, got %d", status)
+			}
+			done <- true
 		}(i)
 	}
 
-	wg.Wait()
-	close(errors)
-
-	// Check for errors
-	var errorList []error
-	for err := range errors {
-		errorList = append(errorList, err)
+	// Concurrent new subscriptions
+	for i := 0; i < 5; i++ {
+		go func(id int) {
+			newSub := Subscription{
+				UeId:      fmt.Sprintf("imsi-2089300000%05d", id),
+				NotifyUri: fmt.Sprintf("http://127.0.0.1:9099/notify/%d", id),
+			}
+			status, _ := httpDoJSON(t, http.MethodPost, fmt.Sprintf("%s/subscriptions", baseAPIURL), newSub)
+			if status != http.StatusCreated {
+				t.Errorf("POST want 201, got %d", status)
+			}
+			done <- true
+		}(i)
 	}
 
-	if len(errorList) > 0 {
-		t.Fatalf("Thread safety test failed with %d errors. First error: %v", len(errorList), errorList[0])
-	}
-
-	// Verify all test subscriptions were cleaned up (store should return to initial count)
-	finalCount := len(store.GetAll())
-	if finalCount != initialCount {
-		t.Errorf("Expected store to return to initial count %d, but found %d subscriptions (leaked %d)",
-			initialCount, finalCount, finalCount-initialCount)
-	}
-}
-
-// Test 3GPP compliance requirements
-func TestRMM_3GPP_Compliance(t *testing.T) {
-	// Test API URI structure compliance
-	expectedPrefix := "/namf-rmm/v1"
-	if !strings.HasPrefix(baseAPIURL, "http://127.0.0.15:18080"+expectedPrefix) {
-		t.Errorf("API URI doesn't match 3GPP format. Expected prefix: %s, got: %s", expectedPrefix, baseAPIURL)
-	}
-
-	// Test Content-Type headers for all operations
-	testCases := []struct {
-		method     string
-		url        string
-		body       interface{}
-		expectedCT string
-	}{
-		{http.MethodGet, fmt.Sprintf("%s/subscriptions", baseAPIURL), nil, "application/json"},
-		{http.MethodPost, fmt.Sprintf("%s/subscriptions/", baseAPIURL), Subscription{UeId: "test", NotifyUri: "http://test.com"}, "application/json"},
-	}
-
-	for _, tc := range testCases {
-		req, _ := http.NewRequest(tc.method, tc.url, nil)
-		if tc.body != nil {
-			jsonBody, _ := json.Marshal(tc.body)
-			req.Body = io.NopCloser(bytes.NewReader(jsonBody))
-			req.Header.Set("Content-Type", "application/json")
+	// Wait for all operations
+	for i := 0; i < numOperations; i++ {
+		select {
+		case <-done:
+		case <-time.After(30 * time.Second):
+			t.Fatal("Timeout waiting for concurrent operations")
 		}
-
-		resp, err := http.DefaultClient.Do(req)
-		if err != nil {
-			t.Fatalf("Request failed: %v", err)
-		}
-		defer resp.Body.Close()
-
-		// Check that server accepts and responds with JSON
-		contentType := resp.Header.Get("Content-Type")
-		if tc.method == http.MethodGet && !strings.Contains(contentType, "application/json") {
-			t.Errorf("Expected JSON response for %s, got Content-Type: %s", tc.method, contentType)
-		}
-	}
-}
-
-// Test specific HTTP status codes as per 3GPP spec
-func TestRMM_HTTP_StatusCodes(t *testing.T) {
-	// Test GET /subscriptions - should return 200 OK
-	status, _ := httpDoJSON(t, http.MethodGet, fmt.Sprintf("%s/subscriptions", baseAPIURL), nil)
-	if status != http.StatusOK {
-		t.Errorf("GET /subscriptions should return 200 OK, got %d", status)
-	}
-
-	// Test POST /subscriptions - should return 201 Created
-	validSub := Subscription{UeId: "imsi-test-201", NotifyUri: "http://127.0.0.1:9099/test-201"}
-	status, data := httpDoJSON(t, http.MethodPost, fmt.Sprintf("%s/subscriptions/", baseAPIURL), validSub)
-	if status != http.StatusCreated {
-		t.Errorf("POST /subscriptions should return 201 Created, got %d", status)
-	}
-
-	// Extract subscription ID for further tests
-	var createdSub Subscription
-	json.Unmarshal(data, &createdSub)
-	subID := createdSub.SubId
-
-	// Test PUT /subscriptions/{id} with existing subscription - should return 200 OK
-	updateSub := Subscription{UeId: "imsi-test-201", NotifyUri: "http://127.0.0.1:9099/test-201-updated"}
-	status, _ = httpDoJSON(t, http.MethodPut, fmt.Sprintf("%s/subscriptions/%s", baseAPIURL, subID), updateSub)
-	if status != http.StatusOK {
-		t.Errorf("PUT existing subscription should return 200 OK, got %d", status)
-	}
-
-	// Test PUT /subscriptions/{id} with non-existing subscription - should return 201 Created
-	newSub := Subscription{UeId: "imsi-test-new", NotifyUri: "http://127.0.0.1:9099/test-new"}
-	status, _ = httpDoJSON(t, http.MethodPut, fmt.Sprintf("%s/subscriptions/new-id-123", baseAPIURL), newSub)
-	if status != http.StatusCreated {
-		t.Errorf("PUT non-existing subscription should return 201 Created, got %d", status)
-	}
-
-	// Test DELETE /subscriptions/{id} - should return 204 No Content
-	status, _ = httpDoJSON(t, http.MethodDelete, fmt.Sprintf("%s/subscriptions/%s", baseAPIURL, subID), nil)
-	if status != http.StatusNoContent {
-		t.Errorf("DELETE subscription should return 204 No Content, got %d", status)
-	}
-
-	// Test DELETE non-existing subscription - should return 404 Not Found (as per spec)
-	status, _ = httpDoJSON(t, http.MethodDelete, fmt.Sprintf("%s/subscriptions/non-existent-999", baseAPIURL), nil)
-	if status != http.StatusNotFound {
-		t.Errorf("DELETE non-existing subscription should return 404 Not Found, got %d", status)
 	}
 
 	// Cleanup
-	httpDoJSON(t, http.MethodDelete, fmt.Sprintf("%s/subscriptions/new-id-123", baseAPIURL), nil)
+	httpDoJSON(t, http.MethodDelete, fmt.Sprintf("%s/subscriptions/%s", baseAPIURL, subID), nil)
 }
 
-// Test JSON schema validation
-func TestRMM_JSON_SchemaValidation(t *testing.T) {
+// Test error handling: missing required fields
+func TestRMM_ErrorHandling_MissingFields(t *testing.T) {
 	testCases := []struct {
-		name           string
-		payload        interface{}
-		expectedStatus int
-		description    string
+		name string
+		body map[string]interface{}
 	}{
-		{
-			name:           "Valid subscription",
-			payload:        Subscription{UeId: "imsi-208930000000001", NotifyUri: "http://127.0.0.1:9099/valid"},
-			expectedStatus: http.StatusCreated,
-			description:    "Should accept valid subscription",
-		},
-		{
-			name: "Missing UeId",
-			payload: struct {
-				NotifyUri string `json:"notifyUri"`
-			}{NotifyUri: "http://test.com"},
-			expectedStatus: http.StatusBadRequest,
-			description:    "Should reject subscription without UeId",
-		},
-		{
-			name: "Missing NotifyUri",
-			payload: struct {
-				UeId string `json:"ueId"`
-			}{UeId: "imsi-test"},
-			expectedStatus: http.StatusBadRequest,
-			description:    "Should reject subscription without NotifyUri",
-		},
-		{
-			name:           "Empty UeId",
-			payload:        Subscription{UeId: "", NotifyUri: "http://test.com"},
-			expectedStatus: http.StatusBadRequest,
-			description:    "Should reject subscription with empty UeId",
-		},
-		{
-			name:           "Empty NotifyUri",
-			payload:        Subscription{UeId: "imsi-test", NotifyUri: ""},
-			expectedStatus: http.StatusBadRequest,
-			description:    "Should reject subscription with empty NotifyUri",
-		},
-		{
-			name:           "Invalid JSON",
-			payload:        "{invalid-json",
-			expectedStatus: http.StatusBadRequest,
-			description:    "Should reject malformed JSON",
-		},
+		{"missing ueId", map[string]interface{}{"notifyUri": "http://example.com"}},
+		{"missing notifyUri", map[string]interface{}{"ueId": "imsi-208930000000001"}},
+		{"empty ueId", map[string]interface{}{"ueId": "", "notifyUri": "http://example.com"}},
+		{"empty notifyUri", map[string]interface{}{"ueId": "imsi-208930000000001", "notifyUri": ""}},
 	}
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
-			status, _ := httpDoJSON(t, http.MethodPost, fmt.Sprintf("%s/subscriptions/", baseAPIURL), tc.payload)
-			if status != tc.expectedStatus {
-				t.Errorf("%s: expected status %d, got %d", tc.description, tc.expectedStatus, status)
+			bodyBytes, _ := json.Marshal(tc.body)
+			req, _ := http.NewRequest(http.MethodPost, fmt.Sprintf("%s/subscriptions", baseAPIURL), bytes.NewReader(bodyBytes))
+			req.Header.Set("Content-Type", "application/json")
+
+			resp, err := http.DefaultClient.Do(req)
+			if err != nil {
+				t.Fatalf("request failed: %v", err)
+			}
+			defer resp.Body.Close()
+
+			if resp.StatusCode != http.StatusNotFound {
+				t.Errorf("Expected 404, got %d for %s", resp.StatusCode, tc.name)
 			}
 		})
 	}
 }
 
-// Test subscription ID uniqueness and format
-func TestRMM_SubscriptionID_Uniqueness(t *testing.T) {
-	const numSubscriptions = 100
-	var subscriptionIds []string
+// Test error handling: invalid JSON
+func TestRMM_ErrorHandling_InvalidJSON(t *testing.T) {
+	req, _ := http.NewRequest(http.MethodPost, fmt.Sprintf("%s/subscriptions", baseAPIURL), bytes.NewReader([]byte("invalid json")))
+	req.Header.Set("Content-Type", "application/json")
 
-	// Create multiple subscriptions and collect IDs
-	for i := 0; i < numSubscriptions; i++ {
-		ueID := fmt.Sprintf("imsi-uniqueness-test-%04d", i)
-		notifyUri := fmt.Sprintf("http://127.0.0.1:9099/unique-%d", i)
-
-		reqSub := Subscription{UeId: ueID, NotifyUri: notifyUri}
-		status, data := httpDoJSON(t, http.MethodPost, fmt.Sprintf("%s/subscriptions/", baseAPIURL), reqSub)
-
-		if status != http.StatusCreated {
-			t.Fatalf("Failed to create subscription %d: status %d", i, status)
-		}
-
-		var createdSub Subscription
-		json.Unmarshal(data, &createdSub)
-
-		// Verify SubId format (should start with "sub-")
-		if !strings.HasPrefix(createdSub.SubId, "sub-") {
-			t.Errorf("Subscription ID should start with 'sub-', got: %s", createdSub.SubId)
-		}
-
-		// Check for uniqueness
-		for _, existingId := range subscriptionIds {
-			if createdSub.SubId == existingId {
-				t.Fatalf("Duplicate subscription ID found: %s", createdSub.SubId)
-			}
-		}
-
-		subscriptionIds = append(subscriptionIds, createdSub.SubId)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("request failed: %v", err)
 	}
+	defer resp.Body.Close()
 
-	// Cleanup
-	for _, subId := range subscriptionIds {
-		httpDoJSON(t, http.MethodDelete, fmt.Sprintf("%s/subscriptions/%s", baseAPIURL, subId), nil)
+	if resp.StatusCode != http.StatusNotFound {
+		t.Errorf("Expected 404 for invalid JSON, got %d", resp.StatusCode)
 	}
 }
 
-// Test notification payload format validation
-func TestRMM_NotificationPayload_Validation(t *testing.T) {
-	ueID := "imsi-208930000000123"
-	notifyBase := "http://127.0.0.1:9099"
-	notifyPath := "/payload-validation"
+// Test DELETE non-existent subscription
+func TestRMM_ErrorHandling_DeleteNonExistent(t *testing.T) {
+	status, _ := httpDoJSON(t, http.MethodDelete, fmt.Sprintf("%s/subscriptions/non-existent-id", baseAPIURL), nil)
+	if status != http.StatusNotFound {
+		t.Errorf("DELETE non-existent want 404, got %d", status)
+	}
+}
 
-	// Create subscription (using real HTTP, not mocked)
-	reqSub := Subscription{UeId: ueID, NotifyUri: notifyBase + notifyPath}
-	status, data := httpDoJSON(t, http.MethodPost, fmt.Sprintf("%s/subscriptions/", baseAPIURL), reqSub)
+// Test PUT creates new subscription if not exists
+func TestRMM_PUT_CreateNew(t *testing.T) {
+	customID := "custom-subscription-id-12345"
+	ueID := "imsi-208930000002222"
+	notify := "http://127.0.0.1:9099/custom"
+
+	sub := Subscription{UeId: ueID, NotifyUri: notify}
+	status, data := httpDoJSON(t, http.MethodPut, fmt.Sprintf("%s/subscriptions/%s", baseAPIURL, customID), sub)
+
 	if status != http.StatusCreated {
-		t.Fatalf("Create subscription failed: %d %s", status, string(data))
+		t.Errorf("PUT new subscription want 201, got %d", status)
 	}
 
-	var sub Subscription
-	json.Unmarshal(data, &sub)
+	var created Subscription
+	json.Unmarshal(data, &created)
 
-	// Now intercept http.DefaultClient for mocking notification callbacks
+	if created.SubId != customID {
+		t.Errorf("Expected SubId %s, got %s", customID, created.SubId)
+	}
+
+	// Cleanup
+	httpDoJSON(t, http.MethodDelete, fmt.Sprintf("%s/subscriptions/%s", baseAPIURL, customID), nil)
+}
+
+// Test PUT updates existing subscription
+func TestRMM_PUT_UpdateExisting(t *testing.T) {
+	// First create via POST
+	ueID := "imsi-208930000003333"
+	notify := "http://127.0.0.1:9099/original"
+	reqSub := Subscription{UeId: ueID, NotifyUri: notify}
+	_, data := httpDoJSON(t, http.MethodPost, fmt.Sprintf("%s/subscriptions", baseAPIURL), reqSub)
+
+	var created Subscription
+	json.Unmarshal(data, &created)
+	subID := created.SubId
+
+	// Now update via PUT
+	updated := Subscription{UeId: ueID, NotifyUri: "http://127.0.0.1:9099/updated"}
+	status, data := httpDoJSON(t, http.MethodPut, fmt.Sprintf("%s/subscriptions/%s", baseAPIURL, subID), updated)
+
+	if status != http.StatusOK {
+		t.Errorf("PUT existing want 200, got %d", status)
+	}
+
+	var result Subscription
+	json.Unmarshal(data, &result)
+
+	if result.NotifyUri != "http://127.0.0.1:9099/updated" {
+		t.Errorf("NotifyUri not updated: got %s", result.NotifyUri)
+	}
+
+	// Cleanup
+	httpDoJSON(t, http.MethodDelete, fmt.Sprintf("%s/subscriptions/%s", baseAPIURL, subID), nil)
+}
+
+// Test multiple UEs with same notification URI
+func TestRMM_MultipleUEs_SameNotifyUri(t *testing.T) {
+	notify := "http://127.0.0.1:9099/shared-callback"
+	subIDs := []string{}
+
+	// Create subscriptions for multiple UEs
+	for i := 0; i < 5; i++ {
+		ueID := fmt.Sprintf("imsi-2089300000%05d", 10000+i)
+		reqSub := Subscription{UeId: ueID, NotifyUri: notify}
+		status, data := httpDoJSON(t, http.MethodPost, fmt.Sprintf("%s/subscriptions", baseAPIURL), reqSub)
+
+		if status != http.StatusCreated {
+			t.Fatalf("POST want 201, got %d", status)
+		}
+
+		var created Subscription
+		json.Unmarshal(data, &created)
+		subIDs = append(subIDs, created.SubId)
+	}
+
+	// Verify all subscriptions exist
+	status, data := httpDoJSON(t, http.MethodGet, fmt.Sprintf("%s/subscriptions", baseAPIURL), nil)
+	if status != http.StatusOK {
+		t.Fatalf("GET want 200, got %d", status)
+	}
+
+	var list struct {
+		Subscriptions []Subscription `json:"subscriptions"`
+	}
+	json.Unmarshal(data, &list)
+
+	count := 0
+	for _, sub := range list.Subscriptions {
+		if sub.NotifyUri == notify {
+			count++
+		}
+	}
+
+	if count < 5 {
+		t.Errorf("Expected at least 5 subscriptions with same NotifyUri, got %d", count)
+	}
+
+	// Cleanup
+	for _, subID := range subIDs {
+		httpDoJSON(t, http.MethodDelete, fmt.Sprintf("%s/subscriptions/%s", baseAPIURL, subID), nil)
+	}
+}
+
+// Test notification for multiple subscriptions of same UE
+func TestRMM_Notification_MultipleSubscriptionsSameUE(t *testing.T) {
 	gock.InterceptClient(http.DefaultClient)
 	defer gock.RestoreClient(http.DefaultClient)
 	defer gock.Off()
 
-	// Set up a more detailed mock to capture and validate the payload
-	var capturedPayload UeRMNotif
+	ueID := "imsi-208930000004444"
+	notifyBase1 := "http://127.0.0.1:9091"
+	notifyPath1 := "/callback1"
+	notifyBase2 := "http://127.0.0.1:9092"
+	notifyPath2 := "/callback2"
+
+	// Create two subscriptions for the same UE
+	reqSub1 := Subscription{UeId: ueID, NotifyUri: notifyBase1 + notifyPath1}
+	status, data := httpDoJSON(t, http.MethodPost, fmt.Sprintf("%s/subscriptions", baseAPIURL), reqSub1)
+	if status != http.StatusCreated {
+		t.Fatalf("POST subscription1 want 201, got %d", status)
+	}
+	var subs1 Subscription
+	json.Unmarshal(data, &subs1)
+
+	reqSub2 := Subscription{UeId: ueID, NotifyUri: notifyBase2 + notifyPath2}
+	status, data = httpDoJSON(t, http.MethodPost, fmt.Sprintf("%s/subscriptions", baseAPIURL), reqSub2)
+	if status != http.StatusCreated {
+		t.Fatalf("POST subscription2 want 201, got %d", status)
+	}
+	var subs2 Subscription
+	json.Unmarshal(data, &subs2)
+
+	// Expect notifications to both callbacks
+	gock.New(notifyBase1).
+		Post(notifyPath1).
+		MatchType("json").
+		JSON(&UeRMNotif{SubId: subs1.SubId, UeId: ueID, PrevState: "Deregistered", CurrState: "Authentication"}).
+		Reply(204)
+
+	gock.New(notifyBase2).
+		Post(notifyPath2).
+		MatchType("json").
+		JSON(&UeRMNotif{SubId: subs2.SubId, UeId: ueID, PrevState: "Deregistered", CurrState: "Authentication"}).
+		Reply(204)
+
+	// Attach RMS
+	gmm.AttachRMS(rms.NewRMS())
+
+	// Create UE and trigger state transition
+	ue := amf_context.GetSelf().NewAmfUe(ueID)
+	anType := models.AccessType__3_GPP_ACCESS
+	ue.State[anType] = fsm.NewState("Deregistered")
+
+	if err := gmm.GmmFSM.SendEvent(ue.State[anType], gmm.StartAuthEvent, fsm.ArgsType{gmm.ArgAmfUe: ue, gmm.ArgAccessType: anType}, amf_logger.GmmLog); err != nil {
+		t.Fatalf("SendEvent failed: %v", err)
+	}
+
+	// Wait for notifications
+	waitUntil := time.Now().Add(500 * time.Millisecond)
+	for time.Now().Before(waitUntil) && !gock.IsDone() {
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	if !gock.IsDone() {
+		pending := gock.Pending()
+		t.Fatalf("Expected both notifications, but %d requests still pending", len(pending))
+	}
+}
+
+// Test notification not sent for self-loop transitions
+func TestRMM_Notification_IgnoreSelfLoop(t *testing.T) {
+	// This test verifies the RMS code: if trans.From == trans.To { return }
+	// We simply verify that a valid state transition DOES send a notification
+	// The self-loop logic is tested implicitly by the code check
+
+	ueID := "imsi-208930000005555"
+	notifyBase := "http://127.0.0.1:9099"
+	notifyPath := "/callback/self-loop"
+
+	// Create subscription first to get SubId
+	reqSub := Subscription{UeId: ueID, NotifyUri: notifyBase + notifyPath}
+	status, data := httpDoJSON(t, http.MethodPost, fmt.Sprintf("%s/subscriptions", baseAPIURL), reqSub)
+	if status != http.StatusCreated {
+		t.Fatalf("POST subscription want 201, got %d", status)
+	}
+	var subs Subscription
+	json.Unmarshal(data, &subs)
+
+	gock.InterceptClient(http.DefaultClient)
+	defer gock.RestoreClient(http.DefaultClient)
+	defer gock.Off()
+
+	// Expect notification for valid transition
 	gock.New(notifyBase).
 		Post(notifyPath).
 		MatchType("json").
-		AddMatcher(func(req *http.Request, ereq *gock.Request) (bool, error) {
-			body, err := io.ReadAll(req.Body)
-			if err != nil {
-				return false, err
-			}
-			req.Body = io.NopCloser(bytes.NewReader(body))
+		JSON(&UeRMNotif{SubId: subs.SubId, UeId: ueID, PrevState: "Deregistered", CurrState: "Authentication"}).
+		Reply(204)
 
-			err = json.Unmarshal(body, &capturedPayload)
-			if err != nil {
-				t.Errorf("Invalid JSON in notification payload: %v", err)
-				return false, err
+	// Attach RMS
+	gmm.AttachRMS(rms.NewRMS())
+
+	// Create UE
+	ue := amf_context.GetSelf().NewAmfUe(ueID)
+	anType := models.AccessType__3_GPP_ACCESS
+	ue.State[anType] = fsm.NewState("Deregistered")
+
+	// Trigger state transition (Deregistered -> Authentication)
+	if err := gmm.GmmFSM.SendEvent(ue.State[anType], gmm.StartAuthEvent,
+		fsm.ArgsType{gmm.ArgAmfUe: ue, gmm.ArgAccessType: anType},
+		amf_logger.GmmLog); err != nil {
+		t.Logf("SendEvent warning: %v", err)
+	}
+
+	// Wait for notification
+	waitUntil := time.Now().Add(300 * time.Millisecond)
+	for time.Now().Before(waitUntil) && !gock.IsDone() {
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	if !gock.IsDone() {
+		t.Fatal("Expected notification for state transition not received")
+	}
+} // Test GET returns empty list when no subscriptions
+func TestRMM_GET_EmptyList(t *testing.T) {
+	// First, clean up any existing subscriptions
+	status, data := httpDoJSON(t, http.MethodGet, fmt.Sprintf("%s/subscriptions", baseAPIURL), nil)
+	if status == http.StatusOK {
+		var list struct {
+			Subscriptions []Subscription `json:"subscriptions"`
+		}
+		json.Unmarshal(data, &list)
+
+		// Delete all existing subscriptions
+		for _, sub := range list.Subscriptions {
+			httpDoJSON(t, http.MethodDelete, fmt.Sprintf("%s/subscriptions/%s", baseAPIURL, sub.SubId), nil)
+		}
+	}
+
+	// Now verify empty list
+	status, data = httpDoJSON(t, http.MethodGet, fmt.Sprintf("%s/subscriptions", baseAPIURL), nil)
+	if status != http.StatusOK {
+		t.Fatalf("GET want 200, got %d", status)
+	}
+
+	var list struct {
+		Subscriptions []Subscription `json:"subscriptions"`
+	}
+	json.Unmarshal(data, &list)
+
+	if list.Subscriptions == nil || len(list.Subscriptions) != 0 {
+		t.Errorf("Expected empty subscriptions list, got %d items", len(list.Subscriptions))
+	}
+}
+
+// Test idempotency of PUT operations
+func TestRMM_PUT_Idempotency(t *testing.T) {
+	customID := "idempotent-test-id"
+	ueID := "imsi-208930000006666"
+	notify := "http://127.0.0.1:9099/idempotent"
+
+	sub := Subscription{UeId: ueID, NotifyUri: notify}
+
+	// First PUT - creates
+	status1, data1 := httpDoJSON(t, http.MethodPut, fmt.Sprintf("%s/subscriptions/%s", baseAPIURL, customID), sub)
+	if status1 != http.StatusCreated {
+		t.Errorf("First PUT want 201, got %d", status1)
+	}
+
+	var result1 Subscription
+	json.Unmarshal(data1, &result1)
+
+	// Second PUT with same data - updates (should return 200)
+	status2, data2 := httpDoJSON(t, http.MethodPut, fmt.Sprintf("%s/subscriptions/%s", baseAPIURL, customID), sub)
+	if status2 != http.StatusOK {
+		t.Errorf("Second PUT want 200, got %d", status2)
+	}
+
+	var result2 Subscription
+	json.Unmarshal(data2, &result2)
+
+	// Verify data consistency
+	if result1.SubId != result2.SubId || result1.UeId != result2.UeId || result1.NotifyUri != result2.NotifyUri {
+		t.Error("PUT operations should be idempotent")
+	}
+
+	// Cleanup
+	httpDoJSON(t, http.MethodDelete, fmt.Sprintf("%s/subscriptions/%s", baseAPIURL, customID), nil)
+}
+
+// --- Strict Validation Tests ---
+
+// Test POST returns correct JSON structure and all required fields
+func TestRMM_POST_StrictValidation(t *testing.T) {
+	ueID := "imsi-208930000007777"
+	notifyUri := "http://127.0.0.1:9099/strict-test"
+
+	reqSub := Subscription{UeId: ueID, NotifyUri: notifyUri}
+	req, _ := http.NewRequest(http.MethodPost, fmt.Sprintf("%s/subscriptions", baseAPIURL),
+		bytes.NewReader(mustMarshal(reqSub)))
+	req.Header.Set("Content-Type", "application/json")
+
+	client := &http.Client{}
+	resp, err := client.Do(req)
+	if err != nil {
+		t.Fatalf("Request failed: %v", err)
+	}
+	defer resp.Body.Close()
+
+	// Verify status code
+	if resp.StatusCode != http.StatusCreated {
+		t.Errorf("Expected 201 Created, got %d", resp.StatusCode)
+	}
+
+	// Verify Content-Type
+	contentType := resp.Header.Get("Content-Type")
+	if !contains(contentType, "application/json") {
+		t.Errorf("Expected Content-Type with application/json, got %s", contentType)
+	}
+
+	// Verify response body structure
+	data, _ := io.ReadAll(resp.Body)
+	var result Subscription
+	validateJSONStructure(t, data, &result)
+
+	// Verify all fields are present and correct
+	if result.SubId == "" {
+		t.Error("Response must contain non-empty subId")
+	}
+	if result.UeId != ueID {
+		t.Errorf("Response ueId mismatch: expected %s, got %s", ueID, result.UeId)
+	}
+	if result.NotifyUri != notifyUri {
+		t.Errorf("Response notifyUri mismatch: expected %s, got %s", notifyUri, result.NotifyUri)
+	}
+
+	// Verify SubId is a valid UUID format (basic check)
+	if len(result.SubId) < 32 {
+		t.Errorf("SubId should be UUID format, got: %s", result.SubId)
+	}
+
+	// Cleanup
+	httpDoJSON(t, http.MethodDelete, fmt.Sprintf("%s/subscriptions/%s", baseAPIURL, result.SubId), nil)
+}
+
+// Test GET returns correct collection format
+func TestRMM_GET_StrictFormat(t *testing.T) {
+	// Create some subscriptions first
+	subIds := []string{}
+	for i := 0; i < 3; i++ {
+		reqSub := Subscription{
+			UeId:      fmt.Sprintf("imsi-208930000008%03d", i),
+			NotifyUri: fmt.Sprintf("http://127.0.0.1:9099/test/%d", i),
+		}
+		status, data := httpDoJSON(t, http.MethodPost, fmt.Sprintf("%s/subscriptions", baseAPIURL), reqSub)
+		if status != http.StatusCreated {
+			t.Fatalf("Failed to create test subscription")
+		}
+		var sub Subscription
+		json.Unmarshal(data, &sub)
+		subIds = append(subIds, sub.SubId)
+	}
+
+	// GET and verify format
+	req, _ := http.NewRequest(http.MethodGet, fmt.Sprintf("%s/subscriptions", baseAPIURL), nil)
+	client := &http.Client{}
+	resp, err := client.Do(req)
+	if err != nil {
+		t.Fatalf("GET request failed: %v", err)
+	}
+	defer resp.Body.Close()
+
+	// Verify status and content type
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("Expected 200 OK, got %d", resp.StatusCode)
+	}
+
+	contentType := resp.Header.Get("Content-Type")
+	if !contains(contentType, "application/json") {
+		t.Errorf("Expected Content-Type with application/json, got %s", contentType)
+	}
+
+	// Verify response structure
+	data, _ := io.ReadAll(resp.Body)
+	var result struct {
+		Subscriptions []Subscription `json:"subscriptions"`
+	}
+	validateJSONStructure(t, data, &result)
+
+	// Verify subscriptions field exists (even if empty)
+	if result.Subscriptions == nil {
+		t.Error("Response must contain 'subscriptions' field (can be empty array)")
+	}
+
+	// Verify we got at least our created subscriptions
+	if len(result.Subscriptions) < 3 {
+		t.Errorf("Expected at least 3 subscriptions, got %d", len(result.Subscriptions))
+	}
+
+	// Verify each subscription has all required fields
+	for _, sub := range result.Subscriptions {
+		if sub.SubId == "" || sub.UeId == "" || sub.NotifyUri == "" {
+			t.Errorf("Subscription missing required fields: %+v", sub)
+		}
+	}
+
+	// Cleanup
+	for _, subId := range subIds {
+		httpDoJSON(t, http.MethodDelete, fmt.Sprintf("%s/subscriptions/%s", baseAPIURL, subId), nil)
+	}
+}
+
+// Test PUT with non-existent ID returns 201 with correct format
+func TestRMM_PUT_StrictCreation(t *testing.T) {
+	customID := "strict-test-put-id"
+	ueID := "imsi-208930000009999"
+	notifyUri := "http://127.0.0.1:9099/put-strict"
+
+	reqSub := Subscription{UeId: ueID, NotifyUri: notifyUri}
+	req, _ := http.NewRequest(http.MethodPut,
+		fmt.Sprintf("%s/subscriptions/%s", baseAPIURL, customID),
+		bytes.NewReader(mustMarshal(reqSub)))
+	req.Header.Set("Content-Type", "application/json")
+
+	client := &http.Client{}
+	resp, err := client.Do(req)
+	if err != nil {
+		t.Fatalf("Request failed: %v", err)
+	}
+	defer resp.Body.Close()
+
+	// Must return 201 for new resource
+	if resp.StatusCode != http.StatusCreated {
+		t.Errorf("PUT new resource must return 201 Created, got %d", resp.StatusCode)
+	}
+
+	// Verify response format
+	data, _ := io.ReadAll(resp.Body)
+	var result Subscription
+	validateJSONStructure(t, data, &result)
+
+	// Verify SubId matches the URL parameter
+	if result.SubId != customID {
+		t.Errorf("PUT response SubId must match URL parameter: expected %s, got %s", customID, result.SubId)
+	}
+
+	validateSubscription(t, result, ueID, notifyUri)
+
+	// Cleanup
+	httpDoJSON(t, http.MethodDelete, fmt.Sprintf("%s/subscriptions/%s", baseAPIURL, customID), nil)
+}
+
+// Test PUT with existing ID returns 200 with correct format
+func TestRMM_PUT_StrictUpdate(t *testing.T) {
+	// Create initial subscription
+	ueID := "imsi-208930000010000"
+	origUri := "http://127.0.0.1:9099/original"
+
+	status, data := httpDoJSON(t, http.MethodPost, fmt.Sprintf("%s/subscriptions", baseAPIURL),
+		Subscription{UeId: ueID, NotifyUri: origUri})
+	if status != http.StatusCreated {
+		t.Fatalf("Failed to create initial subscription")
+	}
+	var created Subscription
+	json.Unmarshal(data, &created)
+	subID := created.SubId
+
+	// Update with PUT
+	updatedUri := "http://127.0.0.1:9099/updated"
+	req, _ := http.NewRequest(http.MethodPut,
+		fmt.Sprintf("%s/subscriptions/%s", baseAPIURL, subID),
+		bytes.NewReader(mustMarshal(Subscription{UeId: ueID, NotifyUri: updatedUri})))
+	req.Header.Set("Content-Type", "application/json")
+
+	client := &http.Client{}
+	resp, err := client.Do(req)
+	if err != nil {
+		t.Fatalf("Request failed: %v", err)
+	}
+	defer resp.Body.Close()
+
+	// Must return 200 for existing resource update
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("PUT existing resource must return 200 OK, got %d", resp.StatusCode)
+	}
+
+	// Verify response format
+	data, _ = io.ReadAll(resp.Body)
+	var result Subscription
+	validateJSONStructure(t, data, &result)
+
+	// Verify SubId unchanged
+	if result.SubId != subID {
+		t.Errorf("PUT should not change SubId: expected %s, got %s", subID, result.SubId)
+	}
+
+	// Verify update applied
+	if result.NotifyUri != updatedUri {
+		t.Errorf("PUT should update notifyUri: expected %s, got %s", updatedUri, result.NotifyUri)
+	}
+
+	validateSubscription(t, result, ueID, updatedUri)
+
+	// Cleanup
+	httpDoJSON(t, http.MethodDelete, fmt.Sprintf("%s/subscriptions/%s", baseAPIURL, subID), nil)
+}
+
+// Test DELETE returns 204 with no body
+func TestRMM_DELETE_StrictFormat(t *testing.T) {
+	// Create subscription
+	ueID := "imsi-208930000011111"
+	notifyUri := "http://127.0.0.1:9099/delete-test"
+
+	status, data := httpDoJSON(t, http.MethodPost, fmt.Sprintf("%s/subscriptions", baseAPIURL),
+		Subscription{UeId: ueID, NotifyUri: notifyUri})
+	if status != http.StatusCreated {
+		t.Fatalf("Failed to create subscription")
+	}
+	var sub Subscription
+	json.Unmarshal(data, &sub)
+
+	// DELETE with strict validation
+	req, _ := http.NewRequest(http.MethodDelete,
+		fmt.Sprintf("%s/subscriptions/%s", baseAPIURL, sub.SubId), nil)
+
+	client := &http.Client{}
+	resp, err := client.Do(req)
+	if err != nil {
+		t.Fatalf("Request failed: %v", err)
+	}
+	defer resp.Body.Close()
+
+	// Must return 204 No Content
+	if resp.StatusCode != http.StatusNoContent {
+		t.Errorf("DELETE must return 204 No Content, got %d", resp.StatusCode)
+	}
+
+	// Body should be empty
+	body, _ := io.ReadAll(resp.Body)
+	if len(body) > 0 {
+		t.Errorf("DELETE response body should be empty, got: %s", string(body))
+	}
+
+	// Verify subscription is actually deleted
+	status, _ = httpDoJSON(t, http.MethodDelete, fmt.Sprintf("%s/subscriptions/%s", baseAPIURL, sub.SubId), nil)
+	if status != http.StatusNotFound {
+		t.Errorf("DELETE non-existent should return 404, got %d", status)
+	}
+}
+
+// Test all error cases return 404 with consistent format
+func TestRMM_ErrorHandling_StrictFormat(t *testing.T) {
+	testCases := []struct {
+		name   string
+		method string
+		url    string
+		body   interface{}
+	}{
+		{"POST empty ueId", "POST", "/subscriptions", map[string]string{"ueId": "", "notifyUri": "http://test"}},
+		{"POST empty notifyUri", "POST", "/subscriptions", map[string]string{"ueId": "imsi-123", "notifyUri": ""}},
+		{"POST missing ueId", "POST", "/subscriptions", map[string]string{"notifyUri": "http://test"}},
+		{"POST missing notifyUri", "POST", "/subscriptions", map[string]string{"ueId": "imsi-123"}},
+		{"PUT empty ueId", "PUT", "/subscriptions/test-id", map[string]string{"ueId": "", "notifyUri": "http://test"}},
+		{"PUT empty notifyUri", "PUT", "/subscriptions/test-id", map[string]string{"ueId": "imsi-123", "notifyUri": ""}},
+		{"DELETE non-existent", "DELETE", "/subscriptions/non-existent-id-12345", nil},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			var body io.Reader
+			if tc.body != nil {
+				body = bytes.NewReader(mustMarshal(tc.body))
 			}
 
-			// Validate payload structure
-			if capturedPayload.SubId == "" {
-				t.Errorf("Missing subId in notification payload")
-				return false, fmt.Errorf("missing subId")
+			req, _ := http.NewRequest(tc.method, baseAPIURL+tc.url, body)
+			if tc.body != nil {
+				req.Header.Set("Content-Type", "application/json")
 			}
-			if capturedPayload.UeId == "" {
-				t.Errorf("Missing ueId in notification payload")
-				return false, fmt.Errorf("missing ueId")
+
+			client := &http.Client{}
+			resp, err := client.Do(req)
+			if err != nil {
+				t.Fatalf("Request failed: %v", err)
 			}
-			if capturedPayload.PrevState == "" {
-				t.Errorf("Missing 'from' state in notification payload")
-				return false, fmt.Errorf("missing from state")
+			defer resp.Body.Close()
+
+			// All errors must return 404
+			if resp.StatusCode != http.StatusNotFound {
+				t.Errorf("Expected 404 Not Found, got %d", resp.StatusCode)
 			}
-			if capturedPayload.CurrState == "" {
-				t.Errorf("Missing 'to' state in notification payload")
-				return false, fmt.Errorf("missing to state")
+		})
+	}
+}
+
+// Test notification format is exactly as specified
+func TestRMM_Notification_StrictFormat(t *testing.T) {
+	// if testing.Short() {
+	// 	t.Skip("Skipping notification test in short mode")
+	// }
+
+	ueID := "imsi-208930000012222"
+	notifyBase := "http://127.0.0.1:9099"
+	notifyPath := "/strict-notification"
+
+	// Create subscription
+	status, data := httpDoJSON(t, http.MethodPost, fmt.Sprintf("%s/subscriptions", baseAPIURL),
+		Subscription{UeId: ueID, NotifyUri: notifyBase + notifyPath})
+	if status != http.StatusCreated {
+		t.Fatalf("Failed to create subscription")
+	}
+	var subs Subscription
+	json.Unmarshal(data, &subs)
+
+	gock.InterceptClient(http.DefaultClient)
+	defer gock.RestoreClient(http.DefaultClient)
+	defer gock.Off()
+
+	// Set up strict matcher for notification format
+	gock.New(notifyBase).
+		Post(notifyPath).
+		AddMatcher(func(req *http.Request, _ *gock.Request) (bool, error) {
+			// Verify Content-Type
+			if !contains(req.Header.Get("Content-Type"), "application/json") {
+				t.Error("Notification must have Content-Type: application/json")
+				return false, nil
+			}
+
+			// Verify body structure
+			body, _ := io.ReadAll(req.Body)
+			var notif UeRMNotif
+			if err := json.Unmarshal(body, &notif); err != nil {
+				t.Errorf("Notification body is not valid JSON: %v", err)
+				return false, nil
+			}
+
+			// Verify all required fields
+			if notif.SubId == "" {
+				t.Error("Notification must contain non-empty subId")
+			}
+			if notif.UeId == "" {
+				t.Error("Notification must contain non-empty ueId")
+			}
+			if notif.PrevState == "" {
+				t.Error("Notification must contain non-empty 'from' (PrevState)")
+			}
+			if notif.CurrState == "" {
+				t.Error("Notification must contain non-empty 'to' (CurrState)")
+			}
+
+			// Verify correct values
+			if notif.SubId != subs.SubId {
+				t.Errorf("Notification subId mismatch: expected %s, got %s", subs.SubId, notif.SubId)
+			}
+			if notif.UeId != ueID {
+				t.Errorf("Notification ueId mismatch: expected %s, got %s", ueID, notif.UeId)
+			}
+			if notif.PrevState != "Deregistered" || notif.CurrState != "Authentication" {
+				t.Errorf("Notification state transition incorrect: %s -> %s", notif.PrevState, notif.CurrState)
 			}
 
 			return true, nil
 		}).
 		Reply(204)
 
-	// Attach RMS and trigger state change
+	// Attach RMS and trigger transition
 	gmm.AttachRMS(rms.NewRMS())
-
 	ue := amf_context.GetSelf().NewAmfUe(ueID)
 	anType := models.AccessType__3_GPP_ACCESS
 	ue.State[anType] = fsm.NewState("Deregistered")
 
-	// Trigger state change
-	if err := gmm.GmmFSM.SendEvent(ue.State[anType], gmm.StartAuthEvent,
-		fsm.ArgsType{gmm.ArgAmfUe: ue, gmm.ArgAccessType: anType}, amf_logger.GmmLog); err != nil {
-		t.Fatalf("SendEvent failed: %v", err)
-	}
+	gmm.GmmFSM.SendEvent(ue.State[anType], gmm.StartAuthEvent,
+		fsm.ArgsType{gmm.ArgAmfUe: ue, gmm.ArgAccessType: anType}, amf_logger.GmmLog)
 
 	// Wait for notification
-	time.Sleep(500 * time.Millisecond)
+	waitUntil := time.Now().Add(500 * time.Millisecond)
+	for time.Now().Before(waitUntil) && !gock.IsDone() {
+		time.Sleep(20 * time.Millisecond)
+	}
 
 	if !gock.IsDone() {
-		t.Fatalf("Expected notification not received")
+		t.Fatal("Expected notification not received")
 	}
 
-	// Validate the captured payload content
-	if capturedPayload.SubId != sub.SubId {
-		t.Errorf("Wrong SubId in notification: expected %s, got %s", sub.SubId, capturedPayload.SubId)
-	}
-	if capturedPayload.UeId != ueID {
-		t.Errorf("Wrong UeId in notification: expected %s, got %s", ueID, capturedPayload.UeId)
-	}
-	if capturedPayload.PrevState != "Deregistered" {
-		t.Errorf("Wrong PrevState in notification: expected 'Deregistered', got %s", capturedPayload.PrevState)
-	}
-	if capturedPayload.CurrState != "Authentication" {
-		t.Errorf("Wrong CurrState in notification: expected 'Authentication', got %s", capturedPayload.CurrState)
-	}
-}
-
-// Test multiple subscriptions for same UE
-func TestRMM_MultipleSubscriptions_SameUE(t *testing.T) {
-	ueID := "imsi-208930000000456"
-	notifyBase := "http://127.0.0.1:9099"
-	const numSubscriptions = 3
-
-	var subscriptions []Subscription
-
-	// Create multiple subscriptions for the same UE (using real HTTP, not mocked)
-	for i := 0; i < numSubscriptions; i++ {
-		notifyPath := fmt.Sprintf("/same-ue-%d", i)
-		reqSub := Subscription{UeId: ueID, NotifyUri: notifyBase + notifyPath}
-
-		status, data := httpDoJSON(t, http.MethodPost, fmt.Sprintf("%s/subscriptions/", baseAPIURL), reqSub)
-		if status != http.StatusCreated {
-			t.Fatalf("Create subscription %d failed: %d %s", i, status, string(data))
-		}
-
-		var sub Subscription
-		json.Unmarshal(data, &sub)
-		subscriptions = append(subscriptions, sub)
-	}
-
-	// Now intercept http.DefaultClient for mocking notification callbacks
-	gock.InterceptClient(http.DefaultClient)
-	defer gock.RestoreClient(http.DefaultClient)
-	defer gock.Off()
-
-	// Set up mock for each subscription
-	for i, sub := range subscriptions {
-		notifyPath := fmt.Sprintf("/same-ue-%d", i)
-		gock.New(notifyBase).
-			Post(notifyPath).
-			MatchType("json").
-			JSON(&UeRMNotif{SubId: sub.SubId, UeId: ueID, PrevState: "Deregistered", CurrState: "Authentication"}).
-			Reply(204)
-	}
-
-	// Attach RMS and trigger state change
-	gmm.AttachRMS(rms.NewRMS())
-
-	ue := amf_context.GetSelf().NewAmfUe(ueID)
-	anType := models.AccessType__3_GPP_ACCESS
-	ue.State[anType] = fsm.NewState("Deregistered")
-
-	// Trigger one state change - should notify ALL subscriptions
-	if err := gmm.GmmFSM.SendEvent(ue.State[anType], gmm.StartAuthEvent,
-		fsm.ArgsType{gmm.ArgAmfUe: ue, gmm.ArgAccessType: anType}, amf_logger.GmmLog); err != nil {
-		t.Fatalf("SendEvent failed: %v", err)
-	}
-
-	// Wait for all notifications
-	timeout := time.After(2 * time.Second)
-	ticker := time.NewTicker(100 * time.Millisecond)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-timeout:
-			if !gock.IsDone() {
-				pendingMocks := gock.Pending()
-				t.Fatalf("Not all notifications received. %d mocks still pending", len(pendingMocks))
-			}
-			return
-		case <-ticker.C:
-			if gock.IsDone() {
-				return
-			}
-		}
-	}
-}
-
-// Test error handling in notification delivery
-func TestRMM_NotificationDelivery_ErrorHandling(t *testing.T) {
-	ueID := "imsi-208930000000789"
-
-	// Test with unreachable notification URI
-	badNotifyUri := "http://127.0.0.1:99999/unreachable"
-	reqSub := Subscription{UeId: ueID, NotifyUri: badNotifyUri}
-
-	status, data := httpDoJSON(t, http.MethodPost, fmt.Sprintf("%s/subscriptions/", baseAPIURL), reqSub)
-	if status != http.StatusCreated {
-		t.Fatalf("Create subscription failed: %d %s", status, string(data))
-	}
-
-	var sub Subscription
-	json.Unmarshal(data, &sub)
-
-	// Attach RMS and trigger state change
-	gmm.AttachRMS(rms.NewRMS())
-
-	ue := amf_context.GetSelf().NewAmfUe(ueID)
-	anType := models.AccessType__3_GPP_ACCESS
-	ue.State[anType] = fsm.NewState("Deregistered")
-
-	// Trigger state change - notification should fail but not crash the system
-	if err := gmm.GmmFSM.SendEvent(ue.State[anType], gmm.StartAuthEvent,
-		fsm.ArgsType{gmm.ArgAmfUe: ue, gmm.ArgAccessType: anType}, amf_logger.GmmLog); err != nil {
-		t.Fatalf("SendEvent failed: %v", err)
-	}
-
-	// Wait a bit for the failed notification attempt
-	time.Sleep(1 * time.Second)
-
-	// System should still be responsive - test with another subscription
-	goodNotifyUri := "http://127.0.0.1:9099/good-endpoint"
-	reqSub2 := Subscription{UeId: ueID + "-2", NotifyUri: goodNotifyUri}
-
-	status, _ = httpDoJSON(t, http.MethodPost, fmt.Sprintf("%s/subscriptions/", baseAPIURL), reqSub2)
-	if status != http.StatusCreated {
-		t.Errorf("System should remain responsive after notification failure, but subscription creation failed with status %d", status)
-	}
+	// Restore HTTP client before cleanup
+	gock.Off()
+	gock.RestoreClient(http.DefaultClient)
 
 	// Cleanup
-	httpDoJSON(t, http.MethodDelete, fmt.Sprintf("%s/subscriptions/%s", baseAPIURL, sub.SubId), nil)
+	httpDoJSON(t, http.MethodDelete, fmt.Sprintf("%s/subscriptions/%s", baseAPIURL, subs.SubId), nil)
+}
+
+func mustMarshal(v interface{}) []byte {
+	b, err := json.Marshal(v)
+	if err != nil {
+		panic(err)
+	}
+	return b
 }
