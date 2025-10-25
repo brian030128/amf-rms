@@ -475,7 +475,7 @@ func TestRMM_ConcurrentNotifications(t *testing.T) {
 	// Create subscriptions for multiple UEs (using real HTTP, not mocked)
 	var subscriptions []Subscription
 	for i := 0; i < numUEs; i++ {
-		ueID := fmt.Sprintf("imsi-20893000%06d", i)
+		ueID := fmt.Sprintf("imsi-concurrent-notif-%06d", i)
 		notifyPath := fmt.Sprintf("/notify-ue-%d", i)
 
 		reqSub := Subscription{UeId: ueID, NotifyUri: notifyBase + notifyPath}
@@ -511,7 +511,7 @@ func TestRMM_ConcurrentNotifications(t *testing.T) {
 		go func(index int) {
 			defer wg.Done()
 
-			ueID := fmt.Sprintf("imsi-20893000%06d", index)
+			ueID := fmt.Sprintf("imsi-concurrent-notif-%06d", index)
 			ue := amf_context.GetSelf().NewAmfUe(ueID)
 			anType := models.AccessType__3_GPP_ACCESS
 			ue.State[anType] = fsm.NewState("Deregistered")
@@ -618,6 +618,9 @@ func TestRMM_NotificationStress(t *testing.T) {
 func TestRMM_SubscriptionStore_ThreadSafety(t *testing.T) {
 	store := rms.GetSubscriptionStore()
 
+	// Record initial subscription count (may have leftovers from previous tests)
+	initialCount := len(store.GetAll())
+
 	const numGoroutines = 100
 	const operationsPerGoroutine = 50
 
@@ -692,10 +695,11 @@ func TestRMM_SubscriptionStore_ThreadSafety(t *testing.T) {
 		t.Fatalf("Thread safety test failed with %d errors. First error: %v", len(errorList), errorList[0])
 	}
 
-	// Verify store is clean
-	allSubs := store.GetAll()
-	if len(allSubs) > 0 {
-		t.Errorf("Expected empty store after cleanup, but found %d subscriptions", len(allSubs))
+	// Verify all test subscriptions were cleaned up (store should return to initial count)
+	finalCount := len(store.GetAll())
+	if finalCount != initialCount {
+		t.Errorf("Expected store to return to initial count %d, but found %d subscriptions (leaked %d)",
+			initialCount, finalCount, finalCount-initialCount)
 	}
 }
 
@@ -709,10 +713,10 @@ func TestRMM_3GPP_Compliance(t *testing.T) {
 
 	// Test Content-Type headers for all operations
 	testCases := []struct {
-		method      string
-		url         string
-		body        interface{}
-		expectedCT  string
+		method     string
+		url        string
+		body       interface{}
+		expectedCT string
 	}{
 		{http.MethodGet, fmt.Sprintf("%s/subscriptions", baseAPIURL), nil, "application/json"},
 		{http.MethodPost, fmt.Sprintf("%s/subscriptions/", baseAPIURL), Subscription{UeId: "test", NotifyUri: "http://test.com"}, "application/json"},
@@ -805,14 +809,18 @@ func TestRMM_JSON_SchemaValidation(t *testing.T) {
 			description:    "Should accept valid subscription",
 		},
 		{
-			name:           "Missing UeId",
-			payload:        struct{ NotifyUri string `json:"notifyUri"` }{NotifyUri: "http://test.com"},
+			name: "Missing UeId",
+			payload: struct {
+				NotifyUri string `json:"notifyUri"`
+			}{NotifyUri: "http://test.com"},
 			expectedStatus: http.StatusBadRequest,
 			description:    "Should reject subscription without UeId",
 		},
 		{
-			name:           "Missing NotifyUri",
-			payload:        struct{ UeId string `json:"ueId"` }{UeId: "imsi-test"},
+			name: "Missing NotifyUri",
+			payload: struct {
+				UeId string `json:"ueId"`
+			}{UeId: "imsi-test"},
 			expectedStatus: http.StatusBadRequest,
 			description:    "Should reject subscription without NotifyUri",
 		},
