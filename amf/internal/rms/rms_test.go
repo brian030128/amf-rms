@@ -266,8 +266,8 @@ func TestRMM_Notification_OnGmmTransition(t *testing.T) {
 func TestRMM_API_ErrorHandling(t *testing.T) {
 	// Test invalid JSON payload
 	status, data := httpDoJSON(t, http.MethodPost, fmt.Sprintf("%s/subscriptions/", baseAPIURL), "invalid json")
-	if status != http.StatusBadRequest {
-		t.Errorf("POST with invalid JSON want 400, got %d body=%s", status, string(data))
+	if status != http.StatusNotFound {
+		t.Errorf("POST with invalid JSON want 404, got %d body=%s", status, string(data))
 	}
 
 	// Test missing required fields
@@ -275,8 +275,8 @@ func TestRMM_API_ErrorHandling(t *testing.T) {
 		UeId string `json:"ueId"`
 	}{UeId: "test"}
 	status, data = httpDoJSON(t, http.MethodPost, fmt.Sprintf("%s/subscriptions/", baseAPIURL), invalidSub)
-	if status != http.StatusBadRequest {
-		t.Errorf("POST with missing notifyUri want 400, got %d body=%s", status, string(data))
+	if status != http.StatusNotFound {
+		t.Errorf("POST with missing notifyUri want 404, got %d body=%s", status, string(data))
 	}
 
 	// Test update non-existent subscription
@@ -825,7 +825,7 @@ func TestRMM_JSON_SchemaValidation(t *testing.T) {
 			payload: struct {
 				NotifyUri string `json:"notifyUri"`
 			}{NotifyUri: "http://test.com"},
-			expectedStatus: http.StatusBadRequest,
+			expectedStatus: http.StatusNotFound,
 			description:    "Should reject subscription without UeId",
 		},
 		{
@@ -833,25 +833,25 @@ func TestRMM_JSON_SchemaValidation(t *testing.T) {
 			payload: struct {
 				UeId string `json:"ueId"`
 			}{UeId: "imsi-test"},
-			expectedStatus: http.StatusBadRequest,
+			expectedStatus: http.StatusNotFound,
 			description:    "Should reject subscription without NotifyUri",
 		},
 		{
 			name:           "Empty UeId",
 			payload:        Subscription{UeId: "", NotifyUri: "http://test.com"},
-			expectedStatus: http.StatusBadRequest,
+			expectedStatus: http.StatusNotFound,
 			description:    "Should reject subscription with empty UeId",
 		},
 		{
 			name:           "Empty NotifyUri",
 			payload:        Subscription{UeId: "imsi-test", NotifyUri: ""},
-			expectedStatus: http.StatusBadRequest,
+			expectedStatus: http.StatusNotFound,
 			description:    "Should reject subscription with empty NotifyUri",
 		},
 		{
 			name:           "Invalid JSON",
 			payload:        "{invalid-json",
-			expectedStatus: http.StatusBadRequest,
+			expectedStatus: http.StatusNotFound,
 			description:    "Should reject malformed JSON",
 		},
 	}

@@ -64,12 +64,12 @@ func (s *Server) getSubscriptions(c *gin.Context) {
 func (s *Server) createSubscription(c *gin.Context) {
 	var req rms.Subscription
 	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid JSON payload"})
+		c.JSON(http.StatusNotFound, gin.H{"error": "Invalid JSON payload"})
 		return
 	}
 
 	if req.UeId == "" || req.NotifyUri == "" {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "Missing required fields: ueId and notifyUri"})
+		c.JSON(http.StatusNotFound, gin.H{"error": "Missing required fields: ueId and notifyUri"})
 		return
 	}
 
@@ -85,18 +85,18 @@ func (s *Server) createSubscription(c *gin.Context) {
 func (s *Server) updateSubscription(c *gin.Context) {
 	subscriptionID := c.Param("subscriptionID")
 	if subscriptionID == "" {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "Missing subscriptionID"})
+		c.JSON(http.StatusNotFound, gin.H{"error": "Missing subscriptionID"})
 		return
 	}
 
 	var req rms.Subscription
 	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid JSON payload"})
+		c.JSON(http.StatusNotFound, gin.H{"error": "Invalid JSON payload"})
 		return
 	}
 
 	if req.UeId == "" || req.NotifyUri == "" {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "Missing required fields: ueId and notifyUri"})
+		c.JSON(http.StatusNotFound, gin.H{"error": "Missing required fields: ueId and notifyUri"})
 		return
 	}
 
@@ -113,7 +113,7 @@ func (s *Server) updateSubscription(c *gin.Context) {
 func (s *Server) deleteSubscription(c *gin.Context) {
 	subscriptionID := c.Param("subscriptionID")
 	if subscriptionID == "" {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "Missing subscriptionID"})
+		c.JSON(http.StatusNotFound, gin.H{"error": "Missing subscriptionID"})
 		return
 	}
 
