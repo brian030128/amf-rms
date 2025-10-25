@@ -115,23 +115,16 @@ func GetSubscriptionStore() *SubscriptionStore {
 }
 
 func (rms *CustomizedRMS) HandleEvent(state *fsm.State, event fsm.EventType, args fsm.ArgsType, trans fsm.Transition) {
-	logger.SBILog.Infof("RMS HandleEvent called: event=%s, trans=%v", event, trans)
-
 	ueId := extractUeId(args)
-	logger.SBILog.Infof("Extracted UE ID: %s", ueId)
 	if ueId == "" {
-		logger.SBILog.Warnf("No UE ID found in args: %v", args)
 		return
 	}
 
 	prevState := string(trans.From)
 	currState := string(trans.To)
-	logger.SBILog.Infof("State transition: %s -> %s for UE %s", prevState, currState, ueId)
 
 	subscriptions := rms.store.FindByUeId(ueId)
-	logger.SBILog.Infof("Found %d subscriptions for UE %s", len(subscriptions), ueId)
 	for _, sub := range subscriptions {
-		logger.SBILog.Infof("Sending notification for subscription %s to %s", sub.SubId, sub.NotifyUri)
 		go rms.sendNotification(sub, ueId, prevState, currState)
 	}
 }
@@ -144,15 +137,11 @@ func (rms *CustomizedRMS) sendNotification(sub *Subscription, ueId, prevState, c
 		CurrState: currState,
 	}
 
-	logger.SBILog.Infof("Preparing notification: %+v", notification)
-
 	jsonData, err := json.Marshal(notification)
 	if err != nil {
 		logger.SBILog.Errorf("Failed to marshal notification: %v", err)
 		return
 	}
-
-	logger.SBILog.Infof("Sending POST to %s with payload: %s", sub.NotifyUri, string(jsonData))
 
 	resp, err := http.Post(sub.NotifyUri, "application/json", bytes.NewBuffer(jsonData))
 	if err != nil {
@@ -160,8 +149,6 @@ func (rms *CustomizedRMS) sendNotification(sub *Subscription, ueId, prevState, c
 		return
 	}
 	defer resp.Body.Close()
-
-	logger.SBILog.Infof("Notification response: status=%d", resp.StatusCode)
 
 	if resp.StatusCode != http.StatusNoContent && resp.StatusCode != http.StatusOK {
 		logger.SBILog.Warnf("Notification endpoint %s returned status %d", sub.NotifyUri, resp.StatusCode)
