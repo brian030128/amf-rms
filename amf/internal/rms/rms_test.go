@@ -494,11 +494,12 @@ func TestRMM_ConcurrentNotifications(t *testing.T) {
 	defer gock.RestoreClient(http.DefaultClient)
 	defer gock.Off()
 
-	// Set up gock to accept any notification to the base URL
+	// Set up gock to accept exactly numUEs notifications to the base URL
+	// Use Times(numUEs) instead of Persist() to expect exact number of calls
 	gock.New(notifyBase).
-		Post(".*").
+		Post("/notify-ue-.*").
 		MatchType("json").
-		Persist().
+		Times(numUEs).
 		Reply(204)
 
 	// Attach RMS
@@ -512,6 +513,7 @@ func TestRMM_ConcurrentNotifications(t *testing.T) {
 			defer wg.Done()
 
 			ueID := fmt.Sprintf("imsi-concurrent-notif-%06d", index)
+			t.Logf("Debug: Creating UE %d with ID: %s", index, ueID)
 			ue := amf_context.GetSelf().NewAmfUe(ueID)
 			anType := models.AccessType__3_GPP_ACCESS
 			ue.State[anType] = fsm.NewState("Deregistered")
@@ -520,6 +522,8 @@ func TestRMM_ConcurrentNotifications(t *testing.T) {
 			if err := gmm.GmmFSM.SendEvent(ue.State[anType], gmm.StartAuthEvent,
 				fsm.ArgsType{gmm.ArgAmfUe: ue, gmm.ArgAccessType: anType}, amf_logger.GmmLog); err != nil {
 				t.Errorf("SendEvent for UE %d failed: %v", index, err)
+			} else {
+				t.Logf("Debug: Successfully sent FSM event for UE %d", index)
 			}
 		}(i)
 	}
