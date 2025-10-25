@@ -3,7 +3,6 @@ package rms
 import (
 	"bytes"
 	"encoding/json"
-	"fmt"
 	"net/http"
 	"sync"
 
@@ -115,17 +114,13 @@ func GetSubscriptionStore() *SubscriptionStore {
 }
 
 func (rms *CustomizedRMS) HandleEvent(state *fsm.State, event fsm.EventType, args fsm.ArgsType, trans fsm.Transition) {
-	if trans == nil {
-		return
-	}
-
 	ueId := extractUeId(args)
 	if ueId == "" {
 		return
 	}
 
-	prevState := state.Current()
-	currState := trans.Dst()
+	prevState := string(trans.From)
+	currState := string(trans.To)
 
 	subscriptions := rms.store.FindByUeId(ueId)
 	for _, sub := range subscriptions {

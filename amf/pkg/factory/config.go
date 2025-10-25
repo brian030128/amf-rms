@@ -150,9 +150,9 @@ func (c *Configuration) validate() (bool, error) {
 	if c.ServiceNameList != nil {
 		var errs govalidator.Errors
 		for _, v := range c.ServiceNameList {
-			if v != "namf-comm" && v != "namf-evts" && v != "namf-mt" && v != "namf-loc" && v != "namf-oam" {
+			if v != "namf-comm" && v != "namf-evts" && v != "namf-mt" && v != "namf-loc" && v != "namf-oam" && v != "namf-rmm" {
 				err := fmt.Errorf("invalid ServiceNameList: %s,"+
-					" value should be namf-comm or namf-evts or namf-mt or namf-loc or namf-oam", v)
+					" value should be namf-comm or namf-evts or namf-mt or namf-loc or namf-oam or namf-rmm", v)
 				errs = append(errs, err)
 			}
 		}
