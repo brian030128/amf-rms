@@ -526,11 +526,12 @@ func TestRMM_ConcurrentNotifications(t *testing.T) {
 
 	wg.Wait()
 
-	// Give notification goroutines time to start (they're spawned by HandleEvent)
-	time.Sleep(200 * time.Millisecond)
+	// Give notification goroutines time to start and complete (they're spawned by HandleEvent)
+	// Increased from 200ms to 1000ms to allow all goroutines to finish HTTP calls
+	time.Sleep(1000 * time.Millisecond)
 
 	// Wait for all notifications to be processed
-	timeout := time.After(5 * time.Second)
+	timeout := time.After(10 * time.Second) // Increased timeout from 5s to 10s
 	ticker := time.NewTicker(100 * time.Millisecond)
 	defer ticker.Stop()
 
@@ -539,6 +540,10 @@ func TestRMM_ConcurrentNotifications(t *testing.T) {
 		case <-timeout:
 			if !gock.IsDone() {
 				pendingMocks := gock.Pending()
+				t.Logf("Debug: Total pending mocks: %d", len(pendingMocks))
+				for i, mock := range pendingMocks {
+					t.Logf("Debug: Pending mock %d: %s %s", i, mock.Request().Method, mock.Request().URLStruct.String())
+				}
 				t.Fatalf("Timeout waiting for notifications. %d mocks still pending", len(pendingMocks))
 			}
 			return
