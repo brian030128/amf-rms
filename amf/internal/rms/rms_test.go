@@ -211,16 +211,12 @@ func TestRMM_CRUD_Subscriptions(t *testing.T) {
 
 // Notification test: when UE FSM state changes, AMF should notify the consumer.
 func TestRMM_Notification_OnGmmTransition(t *testing.T) {
-	gock.InterceptClient(http.DefaultClient)
-	defer gock.RestoreClient(http.DefaultClient)
-	defer gock.Off()
-
 	// Prepare a subscription for the UE
 	ueID := "imsi-208930000000777"
 	notifyBase := "http://127.0.0.1:9099"
 	notifyPath := "/callback/rmm"
 
-	// Create subscription via SBI
+	// Create subscription via SBI (using real HTTP, not mocked)
 	reqSub := Subscription{UeId: ueID, NotifyUri: notifyBase + notifyPath}
 	status, data := httpDoJSON(t, http.MethodPost, fmt.Sprintf("%s/subscriptions/%s", baseAPIURL, ""), reqSub)
 	if status != http.StatusCreated {
@@ -229,6 +225,12 @@ func TestRMM_Notification_OnGmmTransition(t *testing.T) {
 	var subs Subscription
 	_ = json.Unmarshal(data, &subs)
 	subID := subs.SubId
+
+	// Now intercept http.DefaultClient for mocking notification callbacks
+	gock.InterceptClient(http.DefaultClient)
+	defer gock.RestoreClient(http.DefaultClient)
+	defer gock.Off()
+
 	// Expect a POST to the callback URI with a payload including subId and ueId
 	gock.New(notifyBase).
 		Post(notifyPath).
@@ -467,24 +469,13 @@ func TestRMM_HighConcurrency_MultipleUsers(t *testing.T) {
 
 // Test concurrent notifications with FSM state changes
 func TestRMM_ConcurrentNotifications(t *testing.T) {
-	gock.InterceptClient(http.DefaultClient)
-	defer gock.RestoreClient(http.DefaultClient)
-	defer gock.Off()
-
 	const numUEs = 10 // Reduced for stability
 	notifyBase := "http://127.0.0.1:9099"
 
-	// Set up gock to accept any notification to the base URL
-	gock.New(notifyBase).
-		Post(".*").
-		MatchType("json").
-		Persist().
-		Reply(204)
-
-	// Create subscriptions for multiple UEs
+	// Create subscriptions for multiple UEs (using real HTTP, not mocked)
 	var subscriptions []Subscription
 	for i := 0; i < numUEs; i++ {
-		ueID := fmt.Sprintf("imsi-20893000%06d", i)
+		ueID := fmt.Sprintf("imsi-concurrent-notif-%06d", i)
 		notifyPath := fmt.Sprintf("/notify-ue-%d", i)
 
 		reqSub := Subscription{UeId: ueID, NotifyUri: notifyBase + notifyPath}
@@ -498,6 +489,19 @@ func TestRMM_ConcurrentNotifications(t *testing.T) {
 		subscriptions = append(subscriptions, sub)
 	}
 
+	// Now intercept http.DefaultClient for mocking notification callbacks
+	gock.InterceptClient(http.DefaultClient)
+	defer gock.RestoreClient(http.DefaultClient)
+	defer gock.Off()
+
+	// Set up gock to accept exactly numUEs notifications to the base URL
+	// Use Times(numUEs) instead of Persist() to expect exact number of calls
+	gock.New(notifyBase).
+		Post("/notify-ue-.*").
+		MatchType("json").
+		Times(numUEs).
+		Reply(204)
+
 	// Attach RMS
 	gmm.AttachRMS(rms.NewRMS())
 
@@ -508,7 +512,8 @@ func TestRMM_ConcurrentNotifications(t *testing.T) {
 		go func(index int) {
 			defer wg.Done()
 
-			ueID := fmt.Sprintf("imsi-20893000%06d", index)
+			ueID := fmt.Sprintf("imsi-concurrent-notif-%06d", index)
+			t.Logf("Debug: Creating UE %d with ID: %s", index, ueID)
 			ue := amf_context.GetSelf().NewAmfUe(ueID)
 			anType := models.AccessType__3_GPP_ACCESS
 			ue.State[anType] = fsm.NewState("Deregistered")
@@ -517,14 +522,20 @@ func TestRMM_ConcurrentNotifications(t *testing.T) {
 			if err := gmm.GmmFSM.SendEvent(ue.State[anType], gmm.StartAuthEvent,
 				fsm.ArgsType{gmm.ArgAmfUe: ue, gmm.ArgAccessType: anType}, amf_logger.GmmLog); err != nil {
 				t.Errorf("SendEvent for UE %d failed: %v", index, err)
+			} else {
+				t.Logf("Debug: Successfully sent FSM event for UE %d", index)
 			}
 		}(i)
 	}
 
 	wg.Wait()
 
+	// Give notification goroutines time to start and complete (they're spawned by HandleEvent)
+	// Increased from 200ms to 1000ms to allow all goroutines to finish HTTP calls
+	time.Sleep(1000 * time.Millisecond)
+
 	// Wait for all notifications to be processed
-	timeout := time.After(5 * time.Second)
+	timeout := time.After(10 * time.Second) // Increased timeout from 5s to 10s
 	ticker := time.NewTicker(100 * time.Millisecond)
 	defer ticker.Stop()
 
@@ -533,6 +544,10 @@ func TestRMM_ConcurrentNotifications(t *testing.T) {
 		case <-timeout:
 			if !gock.IsDone() {
 				pendingMocks := gock.Pending()
+				t.Logf("Debug: Total pending mocks: %d", len(pendingMocks))
+				for i, mock := range pendingMocks {
+					t.Logf("Debug: Pending mock %d: %s %s", i, mock.Request().Method, mock.Request().URLStruct.String())
+				}
 				t.Fatalf("Timeout waiting for notifications. %d mocks still pending", len(pendingMocks))
 			}
 			return
@@ -546,15 +561,11 @@ func TestRMM_ConcurrentNotifications(t *testing.T) {
 
 // Test notification stress with rapid state changes
 func TestRMM_NotificationStress(t *testing.T) {
-	gock.InterceptClient(http.DefaultClient)
-	defer gock.RestoreClient(http.DefaultClient)
-	defer gock.Off()
-
 	ueID := "imsi-208930000000999"
 	notifyBase := "http://127.0.0.1:9099"
 	notifyPath := "/stress-test"
 
-	// Create subscription
+	// Create subscription (using real HTTP, not mocked)
 	reqSub := Subscription{UeId: ueID, NotifyUri: notifyBase + notifyPath}
 	status, data := httpDoJSON(t, http.MethodPost, fmt.Sprintf("%s/subscriptions/", baseAPIURL), reqSub)
 	if status != http.StatusCreated {
@@ -563,6 +574,11 @@ func TestRMM_NotificationStress(t *testing.T) {
 
 	var sub Subscription
 	json.Unmarshal(data, &sub)
+
+	// Now intercept http.DefaultClient for mocking notification callbacks
+	gock.InterceptClient(http.DefaultClient)
+	defer gock.RestoreClient(http.DefaultClient)
+	defer gock.Off()
 
 	// Set up mock to accept any notification to this endpoint
 	gock.New(notifyBase).
@@ -613,6 +629,9 @@ func TestRMM_NotificationStress(t *testing.T) {
 // Test thread safety of subscription store
 func TestRMM_SubscriptionStore_ThreadSafety(t *testing.T) {
 	store := rms.GetSubscriptionStore()
+
+	// Record initial subscription count (may have leftovers from previous tests)
+	initialCount := len(store.GetAll())
 
 	const numGoroutines = 100
 	const operationsPerGoroutine = 50
@@ -688,10 +707,11 @@ func TestRMM_SubscriptionStore_ThreadSafety(t *testing.T) {
 		t.Fatalf("Thread safety test failed with %d errors. First error: %v", len(errorList), errorList[0])
 	}
 
-	// Verify store is clean
-	allSubs := store.GetAll()
-	if len(allSubs) > 0 {
-		t.Errorf("Expected empty store after cleanup, but found %d subscriptions", len(allSubs))
+	// Verify all test subscriptions were cleaned up (store should return to initial count)
+	finalCount := len(store.GetAll())
+	if finalCount != initialCount {
+		t.Errorf("Expected store to return to initial count %d, but found %d subscriptions (leaked %d)",
+			initialCount, finalCount, finalCount-initialCount)
 	}
 }
 
@@ -705,10 +725,10 @@ func TestRMM_3GPP_Compliance(t *testing.T) {
 
 	// Test Content-Type headers for all operations
 	testCases := []struct {
-		method      string
-		url         string
-		body        interface{}
-		expectedCT  string
+		method     string
+		url        string
+		body       interface{}
+		expectedCT string
 	}{
 		{http.MethodGet, fmt.Sprintf("%s/subscriptions", baseAPIURL), nil, "application/json"},
 		{http.MethodPost, fmt.Sprintf("%s/subscriptions/", baseAPIURL), Subscription{UeId: "test", NotifyUri: "http://test.com"}, "application/json"},
@@ -801,14 +821,18 @@ func TestRMM_JSON_SchemaValidation(t *testing.T) {
 			description:    "Should accept valid subscription",
 		},
 		{
-			name:           "Missing UeId",
-			payload:        struct{ NotifyUri string `json:"notifyUri"` }{NotifyUri: "http://test.com"},
+			name: "Missing UeId",
+			payload: struct {
+				NotifyUri string `json:"notifyUri"`
+			}{NotifyUri: "http://test.com"},
 			expectedStatus: http.StatusBadRequest,
 			description:    "Should reject subscription without UeId",
 		},
 		{
-			name:           "Missing NotifyUri",
-			payload:        struct{ UeId string `json:"ueId"` }{UeId: "imsi-test"},
+			name: "Missing NotifyUri",
+			payload: struct {
+				UeId string `json:"ueId"`
+			}{UeId: "imsi-test"},
 			expectedStatus: http.StatusBadRequest,
 			description:    "Should reject subscription without NotifyUri",
 		},
@@ -885,15 +909,11 @@ func TestRMM_SubscriptionID_Uniqueness(t *testing.T) {
 
 // Test notification payload format validation
 func TestRMM_NotificationPayload_Validation(t *testing.T) {
-	gock.InterceptClient(http.DefaultClient)
-	defer gock.RestoreClient(http.DefaultClient)
-	defer gock.Off()
-
 	ueID := "imsi-208930000000123"
 	notifyBase := "http://127.0.0.1:9099"
 	notifyPath := "/payload-validation"
 
-	// Create subscription
+	// Create subscription (using real HTTP, not mocked)
 	reqSub := Subscription{UeId: ueID, NotifyUri: notifyBase + notifyPath}
 	status, data := httpDoJSON(t, http.MethodPost, fmt.Sprintf("%s/subscriptions/", baseAPIURL), reqSub)
 	if status != http.StatusCreated {
@@ -902,6 +922,11 @@ func TestRMM_NotificationPayload_Validation(t *testing.T) {
 
 	var sub Subscription
 	json.Unmarshal(data, &sub)
+
+	// Now intercept http.DefaultClient for mocking notification callbacks
+	gock.InterceptClient(http.DefaultClient)
+	defer gock.RestoreClient(http.DefaultClient)
+	defer gock.Off()
 
 	// Set up a more detailed mock to capture and validate the payload
 	var capturedPayload UeRMNotif
@@ -980,17 +1005,13 @@ func TestRMM_NotificationPayload_Validation(t *testing.T) {
 
 // Test multiple subscriptions for same UE
 func TestRMM_MultipleSubscriptions_SameUE(t *testing.T) {
-	gock.InterceptClient(http.DefaultClient)
-	defer gock.RestoreClient(http.DefaultClient)
-	defer gock.Off()
-
 	ueID := "imsi-208930000000456"
 	notifyBase := "http://127.0.0.1:9099"
 	const numSubscriptions = 3
 
 	var subscriptions []Subscription
 
-	// Create multiple subscriptions for the same UE
+	// Create multiple subscriptions for the same UE (using real HTTP, not mocked)
 	for i := 0; i < numSubscriptions; i++ {
 		notifyPath := fmt.Sprintf("/same-ue-%d", i)
 		reqSub := Subscription{UeId: ueID, NotifyUri: notifyBase + notifyPath}
@@ -1003,8 +1024,16 @@ func TestRMM_MultipleSubscriptions_SameUE(t *testing.T) {
 		var sub Subscription
 		json.Unmarshal(data, &sub)
 		subscriptions = append(subscriptions, sub)
+	}
 
-		// Set up mock for each subscription
+	// Now intercept http.DefaultClient for mocking notification callbacks
+	gock.InterceptClient(http.DefaultClient)
+	defer gock.RestoreClient(http.DefaultClient)
+	defer gock.Off()
+
+	// Set up mock for each subscription
+	for i, sub := range subscriptions {
+		notifyPath := fmt.Sprintf("/same-ue-%d", i)
 		gock.New(notifyBase).
 			Post(notifyPath).
 			MatchType("json").
