@@ -160,8 +160,7 @@ func httpDoJSON(t *testing.T, method, url string, in any) (int, []byte) {
 	if in != nil {
 		req.Header.Set("Content-Type", "application/json")
 	}
-	newClient := &http.Client{}
-	resp, err := newClient.Do(req)
+	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		t.Fatalf("http do: %v", err)
 	}
@@ -589,14 +588,10 @@ func TestRMM_NotificationStress(t *testing.T) {
 		go func(iteration int) {
 			defer wg.Done()
 
-			// Alternate between different state transitions
-			event := gmm.StartAuthEvent
-			if iteration%2 == 0 {
-				event = gmm.AuthSuccessEvent
-			}
-
-			if err := gmm.GmmFSM.SendEvent(ue.State[anType], event,
-				fsm.ArgsType{"AMF Ue": ue, gmm.ArgAccessType: anType}, amf_logger.GmmLog); err != nil {
+			// Use StartAuthEvent which transitions from Deregistered to Authentication
+			// This is a valid transition that doesn't require additional args like EAP
+			if err := gmm.GmmFSM.SendEvent(ue.State[anType], gmm.StartAuthEvent,
+				fsm.ArgsType{gmm.ArgAmfUe: ue, gmm.ArgAccessType: anType}, amf_logger.GmmLog); err != nil {
 				// Some transitions may be invalid, which is expected
 				// Don't fail the test for invalid transitions
 			}
