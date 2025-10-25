@@ -913,40 +913,39 @@ func TestRMM_NotificationPayload_Validation(t *testing.T) {
 	gock.New(notifyBase).
 		Post(notifyPath).
 		MatchType("json").
-		SetMatcher(gock.NewMatcher().
-			Add(func(req *http.Request, ereq *gock.Request) (bool, error) {
-				body, err := io.ReadAll(req.Body)
-				if err != nil {
-					return false, err
-				}
-				req.Body = io.NopCloser(bytes.NewReader(body))
+		AddMatcher(func(req *http.Request, ereq *gock.Request) (bool, error) {
+			body, err := io.ReadAll(req.Body)
+			if err != nil {
+				return false, err
+			}
+			req.Body = io.NopCloser(bytes.NewReader(body))
 
-				err = json.Unmarshal(body, &capturedPayload)
-				if err != nil {
-					t.Errorf("Invalid JSON in notification payload: %v", err)
-					return false, err
-				}
+			err = json.Unmarshal(body, &capturedPayload)
+			if err != nil {
+				t.Errorf("Invalid JSON in notification payload: %v", err)
+				return false, err
+			}
 
-				// Validate payload structure
-				if capturedPayload.SubId == "" {
-					t.Errorf("Missing subId in notification payload")
-					return false, fmt.Errorf("missing subId")
-				}
-				if capturedPayload.UeId == "" {
-					t.Errorf("Missing ueId in notification payload")
-					return false, fmt.Errorf("missing ueId")
-				}
-				if capturedPayload.PrevState == "" {
-					t.Errorf("Missing 'from' state in notification payload")
-					return false, fmt.Errorf("missing from state")
-				}
-				if capturedPayload.CurrState == "" {
-					t.Errorf("Missing 'to' state in notification payload")
-					return false, fmt.Errorf("missing to state")
-				}
+			// Validate payload structure
+			if capturedPayload.SubId == "" {
+				t.Errorf("Missing subId in notification payload")
+				return false, fmt.Errorf("missing subId")
+			}
+			if capturedPayload.UeId == "" {
+				t.Errorf("Missing ueId in notification payload")
+				return false, fmt.Errorf("missing ueId")
+			}
+			if capturedPayload.PrevState == "" {
+				t.Errorf("Missing 'from' state in notification payload")
+				return false, fmt.Errorf("missing from state")
+			}
+			if capturedPayload.CurrState == "" {
+				t.Errorf("Missing 'to' state in notification payload")
+				return false, fmt.Errorf("missing to state")
+			}
 
-				return true, nil
-			})).
+			return true, nil
+		}).
 		Reply(204)
 
 	// Attach RMS and trigger state change
